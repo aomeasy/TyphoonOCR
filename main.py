@@ -113,14 +113,6 @@ st.markdown("""
         margin: 0.5rem 0;
     }
     
-    .rejection-message {
-        background: #ffeaa7;
-        padding: 1rem;
-        border-radius: 8px;
-        border-left: 4px solid #fdcb6e;
-        margin: 0.5rem 0;
-    }
-    
     .stButton > button {
         background: linear-gradient(45deg, #667eea, #764ba2) !important;
         color: white !important;
@@ -143,10 +135,6 @@ if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "rag_db_path" not in st.session_state:
     st.session_state.rag_db_path = "typhoon_rag_knowledge.db"
-if "chunk_size" not in st.session_state:
-    st.session_state.chunk_size = 1000
-if "chunk_overlap" not in st.session_state:
-    st.session_state.chunk_overlap = 200
 
 AVAILABLE_MODELS = {
     "scb10x/typhoon-ocr-7b:latest": {
@@ -166,16 +154,10 @@ AVAILABLE_MODELS = {
         "description": "โมเดลภาษาไทยล่าสุด", 
         "icon": "🇹🇭",
         "best_for": "Thai language, Instructions following"
-    },
-    "nomic-embed-text:latest": {
-        "name": "Nomic Embed Text",
-        "description": "โมเดล Embedding สำหรับ RAG",
-        "icon": "🔍",
-        "best_for": "Text embedding, Similarity search"
     }
 }
 
-# ==================== ENHANCED RAG SYSTEM FUNCTIONS ====================
+# ==================== RAG SYSTEM FUNCTIONS ====================
 
 class RAGKnowledgeBase:
     def __init__(self, db_path: str = "typhoon_rag_knowledge.db"):
@@ -196,9 +178,7 @@ class RAGKnowledgeBase:
                 chunk_id INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 file_hash TEXT,
-                metadata TEXT,
-                heading TEXT,
-                content_type TEXT DEFAULT 'paragraph'
+                metadata TEXT
             )
         ''')
         
@@ -233,55 +213,6 @@ class RAGKnowledgeBase:
         except Exception as e:
             st.error(f"❌ Error getting embedding: {str(e)}")
             return None
-    
-    def chunk_markdown(self, text: str, chunk_size: int = 1000, overlap: int = 200) -> List[Tuple[str, str, str]]:
-        """
-        Enhanced markdown chunking that preserves headings and structure
-        Returns: List of (content, heading, content_type) tuples
-        """
-        chunks = []
-        
-        # Split by major markdown headings
-        sections = re.split(r'\n(?=#{1,6}\s)', text)
-        
-        current_heading = "Introduction"
-        
-        for section in sections:
-            section = section.strip()
-            if not section:
-                continue
-            
-            # Check if this section starts with a heading
-            heading_match = re.match(r'^(#{1,6})\s+(.+)', section)
-            if heading_match:
-                level = len(heading_match.group(1))
-                current_heading = heading_match.group(2).strip()
-                
-                # Remove the heading from content for processing
-                content_without_heading = re.sub(r'^#{1,6}\s+.+\n?', '', section, flags=re.MULTILINE)
-            else:
-                content_without_heading = section
-            
-            # If content is small enough, add as single chunk
-            if len(content_without_heading) <= chunk_size:
-                if content_without_heading.strip():
-                    chunks.append((
-                        f"# {current_heading}\n\n{content_without_heading}",
-                        current_heading,
-                        "section"
-                    ))
-            else:
-                # Split large sections into smaller chunks
-                sub_chunks = self.chunk_text(content_without_heading, chunk_size, overlap)
-                for i, sub_chunk in enumerate(sub_chunks):
-                    chunk_title = f"{current_heading} (Part {i+1})" if len(sub_chunks) > 1 else current_heading
-                    chunks.append((
-                        f"# {chunk_title}\n\n{sub_chunk}",
-                        current_heading,
-                        "subsection"
-                    ))
-        
-        return chunks
     
     def chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
         """Split text into overlapping chunks"""
@@ -321,7 +252,7 @@ class RAGKnowledgeBase:
         return chunks
     
     def add_document(self, filename: str, content: str, metadata: Dict = None) -> bool:
-        """Enhanced document addition with markdown awareness"""
+        """Add document to knowledge base"""
         try:
             # Create file hash for deduplication
             file_hash = hashlib.md5(content.encode()).hexdigest()
@@ -335,44 +266,39 @@ class RAGKnowledgeBase:
                 st.warning(f"⚠️ Document {filename} already exists in knowledge base")
                 return False
             
-            # Enhanced chunking for markdown files
+            # Process markdown content
             if filename.endswith('.md'):
-                chunks = self.chunk_markdown(content, st.session_state.chunk_size, st.session_state.chunk_overlap)
-            else:
-                # Convert markdown to plain text for other files
-                if filename.endswith('.md'):
-                    html = markdown.markdown(content)
-                    plain_text = re.sub('<[^<]+?>', '', html)
-                    content = plain_text
-                
-                # Traditional text chunking
-                text_chunks = self.chunk_text(content, st.session_state.chunk_size, st.session_state.chunk_overlap)
-                chunks = [(chunk, "Document", "paragraph") for chunk in text_chunks]
+                # Convert markdown to plain text for better chunking
+                html = markdown.markdown(content)
+                # Remove HTML tags
+                plain_text = re.sub('<[^<]+?>', '', html)
+                content = plain_text
+            
+            # Chunk the content
+            chunks = self.chunk_text(content)
             
             progress_bar = st.progress(0)
             status_text = st.empty()
             
-            for i, (chunk_content, heading, content_type) in enumerate(chunks):
-                status_text.text(f"Processing chunk {i+1}/{len(chunks)}: {heading[:50]}...")
+            for i, chunk in enumerate(chunks):
+                status_text.text(f"Processing chunk {i+1}/{len(chunks)}...")
                 progress_bar.progress((i + 1) / len(chunks))
                 
                 # Get embedding
-                embedding = self.get_embedding(chunk_content)
+                embedding = self.get_embedding(chunk)
                 if embedding:
-                    # Store in database with enhanced metadata
+                    # Store in database
                     cursor.execute('''
                         INSERT INTO documents 
-                        (filename, content, embedding, chunk_id, file_hash, metadata, heading, content_type)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        (filename, content, embedding, chunk_id, file_hash, metadata)
+                        VALUES (?, ?, ?, ?, ?, ?)
                     ''', (
                         filename, 
-                        chunk_content, 
+                        chunk, 
                         pickle.dumps(embedding), 
                         i,
                         file_hash,
-                        json.dumps(metadata or {}),
-                        heading,
-                        content_type
+                        json.dumps(metadata or {})
                     ))
             
             conn.commit()
@@ -386,11 +312,8 @@ class RAGKnowledgeBase:
             st.error(f"❌ Error adding document: {str(e)}")
             return False
     
-    def mmr_search(self, query: str, top_k: int = 5, lambda_param: float = 0.7) -> List[Tuple[str, str, float, str, str]]:
-        """
-        Enhanced search with MMR (Maximal Marginal Relevance) to reduce redundancy
-        Returns: List of (filename, content, similarity, heading, content_type) tuples
-        """
+    def search_similar(self, query: str, top_k: int = 5) -> List[Tuple[str, str, float]]:
+        """Search for similar content"""
         try:
             query_embedding = self.get_embedding(query)
             if not query_embedding:
@@ -398,162 +321,26 @@ class RAGKnowledgeBase:
             
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            cursor.execute("SELECT filename, content, embedding, heading, content_type FROM documents")
+            cursor.execute("SELECT filename, content, embedding FROM documents")
             
-            # Calculate similarities
-            candidates = []
-            for filename, content, embedding_blob, heading, content_type in cursor.fetchall():
+            results = []
+            for filename, content, embedding_blob in cursor.fetchall():
                 stored_embedding = pickle.loads(embedding_blob)
                 similarity = cosine_similarity(
                     [query_embedding], 
                     [stored_embedding]
                 )[0][0]
-                candidates.append((filename, content, similarity, heading, content_type))
+                results.append((filename, content, similarity))
             
             conn.close()
             
-            # Sort by similarity
-            candidates.sort(key=lambda x: x[2], reverse=True)
-            
-            # Apply MMR
-            selected = []
-            remaining = candidates.copy()
-            
-            while len(selected) < top_k and remaining:
-                if not selected:
-                    # Select the most similar item first
-                    best_item = remaining.pop(0)
-                    selected.append(best_item)
-                else:
-                    # Apply MMR formula
-                    best_score = -float('inf')
-                    best_idx = 0
-                    
-                    for i, candidate in enumerate(remaining):
-                        # Relevance score
-                        relevance = candidate[2]
-                        
-                        # Calculate max similarity to already selected items
-                        max_sim_to_selected = 0
-                        candidate_embedding = self.get_embedding(candidate[1])
-                        
-                        if candidate_embedding:
-                            for selected_item in selected:
-                                selected_embedding = self.get_embedding(selected_item[1])
-                                if selected_embedding:
-                                    sim = cosine_similarity(
-                                        [candidate_embedding], 
-                                        [selected_embedding]
-                                    )[0][0]
-                                    max_sim_to_selected = max(max_sim_to_selected, sim)
-                        
-                        # MMR score
-                        mmr_score = lambda_param * relevance - (1 - lambda_param) * max_sim_to_selected
-                        
-                        if mmr_score > best_score:
-                            best_score = mmr_score
-                            best_idx = i
-                    
-                    selected.append(remaining.pop(best_idx))
-            
-            return selected
+            # Sort by similarity and return top_k
+            results.sort(key=lambda x: x[2], reverse=True)
+            return results[:top_k]
             
         except Exception as e:
-            st.error(f"❌ Error in MMR search: {str(e)}")
+            st.error(f"❌ Error searching: {str(e)}")
             return []
-    
-    def search_similar(self, query: str, top_k: int = 5, use_mmr: bool = True) -> List[Tuple[str, str, float, str, str]]:
-        """
-        Enhanced search with option for MMR or traditional cosine similarity
-        """
-        if use_mmr:
-            return self.mmr_search(query, top_k)
-        else:
-            # Traditional cosine similarity search
-            try:
-                query_embedding = self.get_embedding(query)
-                if not query_embedding:
-                    return []
-                
-                conn = sqlite3.connect(self.db_path)
-                cursor = conn.cursor()
-                cursor.execute("SELECT filename, content, embedding, heading, content_type FROM documents")
-                
-                results = []
-                for filename, content, embedding_blob, heading, content_type in cursor.fetchall():
-                    stored_embedding = pickle.loads(embedding_blob)
-                    similarity = cosine_similarity(
-                        [query_embedding], 
-                        [stored_embedding]
-                    )[0][0]
-                    results.append((filename, content, similarity, heading, content_type))
-                
-                conn.close()
-                
-                # Sort by similarity and return top_k
-                results.sort(key=lambda x: x[2], reverse=True)
-                return results[:top_k]
-                
-            except Exception as e:
-                st.error(f"❌ Error searching: {str(e)}")
-                return []
-    
-    def reindex_documents(self) -> bool:
-        """Re-create embeddings for all documents"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            # Get all documents
-            cursor.execute("SELECT id, content FROM documents WHERE embedding IS NULL OR LENGTH(embedding) = 0")
-            docs_to_reindex = cursor.fetchall()
-            
-            if not docs_to_reindex:
-                st.info("ℹ️ All documents already have embeddings")
-                return True
-            
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            for i, (doc_id, content) in enumerate(docs_to_reindex):
-                status_text.text(f"Re-indexing document {i+1}/{len(docs_to_reindex)}...")
-                progress_bar.progress((i + 1) / len(docs_to_reindex))
-                
-                embedding = self.get_embedding(content)
-                if embedding:
-                    cursor.execute(
-                        "UPDATE documents SET embedding = ? WHERE id = ?",
-                        (pickle.dumps(embedding), doc_id)
-                    )
-            
-            conn.commit()
-            conn.close()
-            
-            status_text.text("✅ Re-indexing completed")
-            progress_bar.progress(1.0)
-            return True
-            
-        except Exception as e:
-            st.error(f"❌ Error re-indexing: {str(e)}")
-            return False
-    
-    def reset_knowledge_base(self) -> bool:
-        """Reset the entire knowledge base"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute("DELETE FROM documents")
-            cursor.execute("DELETE FROM chat_sessions")
-            
-            conn.commit()
-            conn.close()
-            
-            return True
-            
-        except Exception as e:
-            st.error(f"❌ Error resetting knowledge base: {str(e)}")
-            return False
     
     def get_stats(self) -> Dict:
         """Get knowledge base statistics"""
@@ -570,49 +357,36 @@ class RAGKnowledgeBase:
             cursor.execute("SELECT COUNT(*) FROM chat_sessions")
             total_chats = cursor.fetchone()[0]
             
-            cursor.execute("SELECT COUNT(*) FROM documents WHERE embedding IS NULL OR LENGTH(embedding) = 0")
-            missing_embeddings = cursor.fetchone()[0]
-            
             conn.close()
             
             return {
                 "total_documents": total_docs,
                 "total_chunks": total_chunks,
-                "total_chat_sessions": total_chats,
-                "missing_embeddings": missing_embeddings
+                "total_chat_sessions": total_chats
             }
         except Exception as e:
             return {"error": str(e)}
 
-def generate_rag_response(query: str, context_docs: List[Tuple[str, str, float, str, str]], model: str = "qwen2.5:14b", min_similarity: float = 0.3) -> Optional[str]:
-    """Enhanced RAG response generation with strict rejection criteria"""
+def generate_rag_response(query: str, context_docs: List[Tuple[str, str, float]], model: str = "qwen2.5:14b") -> Optional[str]:
+    """Generate response using RAG context"""
     try:
-        # Filter documents by minimum similarity threshold
-        relevant_docs = [doc for doc in context_docs if doc[2] >= min_similarity]
+        # Prepare context
+        context_text = "\n\n".join([
+            f"จากเอกสาร '{doc[0]}':\n{doc[1]}" 
+            for doc in context_docs[:3]  # Use top 3 most relevant
+        ])
         
-        if not relevant_docs:
-            return "ขออภัย ไม่พบข้อมูลที่เกี่ยวข้องกับคำถามของคุณในเอกสารที่มีอยู่ กรุณาลองใช้คำถามที่ชัดเจนมากขึ้น หรือตรวจสอบว่าได้เพิ่มเอกสารที่เกี่ยวข้องเข้าไปในฐานความรู้แล้ว"
-        
-        # Prepare enhanced context with source attribution
-        context_text = ""
-        for i, (filename, content, similarity, heading, content_type) in enumerate(relevant_docs[:3]):
-            context_text += f"**แหล่งที่ {i+1}:** {filename} (หัวข้อ: {heading}) [ความเชื่อมั่น: {similarity:.2%}]\n"
-            context_text += f"{content}\n\n"
-        
-        # Enhanced prompt with strict instructions
-        prompt = f"""คุณเป็น AI Assistant ที่ตอบคำถามจากเอกสารที่ให้มาเท่านั้น กรุณาปฏิบัติตามกฎเหล่านี้อย่างเคร่งครัด:
-
-1. ตอบเฉพาะข้อมูลที่มีในเอกสารที่ให้มา
-2. ห้ามคาดเดาหรือเพิ่มเติมข้อมูลที่ไม่มีในเอกสาร
-3. ระบุแหล่งที่มาของข้อมูลอย่างชัดเจน
-4. หากไม่มีข้อมูลที่เกี่ยวข้อง ให้บอกว่า "ไม่พบข้อมูลที่เกี่ยวข้อง"
+        # Create prompt
+        prompt = f"""คุณเป็น AI Assistant ที่ช่วยตอบคำถามจากเอกสารที่ให้มา ใช้ข้อมูลจากบริบทต่อไปนี้ในการตอบคำถาม:
 
 บริบทจากเอกสาร:
 {context_text}
 
 คำถาม: {query}
 
-คำตอบ (พร้อมอ้างอิงแหล่งที่มา):"""
+กรุณาตอบคำถามโดยอ้างอิงข้อมูลจากเอกสารที่ให้มา หากไม่มีข้อมูลที่เกี่ยวข้องในเอกสาร ให้บอกว่าไม่พบข้อมูลที่เกี่ยวข้อง
+
+คำตอบ:"""
         
         # Call API
         response = requests.post(
@@ -620,7 +394,7 @@ def generate_rag_response(query: str, context_docs: List[Tuple[str, str, float, 
             json={
                 "model": model,
                 "prompt": prompt,
-                "temperature": 0.2,  # Lower temperature for more accurate responses
+                "temperature": 0.3,
                 "top_p": 0.8,
                 "stream": False
             },
@@ -635,7 +409,7 @@ def generate_rag_response(query: str, context_docs: List[Tuple[str, str, float, 
         st.error(f"❌ Error generating RAG response: {str(e)}")
         return None
 
-# ==================== ORIGINAL OCR FUNCTIONS (unchanged) ====================
+# ==================== ORIGINAL OCR FUNCTIONS ====================
 
 def check_system_dependencies():
     """Check if system dependencies are available"""
@@ -1322,8 +1096,8 @@ def main():
     # Header
     st.markdown("""
     <div class="main-header">
-        <h1>🌪️ Typhoon OCR with Enhanced RAG</h1>
-        <p>AI-Powered Thai-English Document Parser + Intelligent Knowledge Q&A</p>
+        <h1>🌪️ Typhoon OCR with RAG</h1>
+        <p>AI-Powered Thai-English Document Parser + Knowledge Q&A</p>
         <p>Powered by SCB 10X with AI NT North Team</p>
     </div>
     """, unsafe_allow_html=True)
@@ -1367,37 +1141,8 @@ def main():
             with col2:
                 st.metric("📄 Chunks", stats["total_chunks"])
             st.metric("💬 Chat Sessions", stats["total_chat_sessions"])
-            
-            # Show missing embeddings warning
-            if stats.get("missing_embeddings", 0) > 0:
-                st.warning(f"⚠️ {stats['missing_embeddings']} chunks need re-indexing")
         else:
             st.error("❌ Knowledge base error")
-        
-        # RAG Settings
-        st.subheader("🔧 RAG Configuration")
-        
-        # Chunk settings
-        new_chunk_size = st.slider(
-            "Chunk Size", 
-            500, 2000, 
-            st.session_state.chunk_size, 
-            100,
-            help="Size of text chunks for embedding"
-        )
-        new_chunk_overlap = st.slider(
-            "Chunk Overlap", 
-            50, 500, 
-            st.session_state.chunk_overlap, 
-            25,
-            help="Overlap between chunks"
-        )
-        
-        # Update session state if changed
-        if new_chunk_size != st.session_state.chunk_size or new_chunk_overlap != st.session_state.chunk_overlap:
-            st.session_state.chunk_size = new_chunk_size
-            st.session_state.chunk_overlap = new_chunk_overlap
-            st.warning("⚠️ Chunk settings changed. Re-index documents for best results.")
         
         # Model selection
         st.subheader("🤖 Model Selection")
@@ -1540,90 +1285,22 @@ def main():
             if st.button("🔄 Clear Files"):
                 st.rerun()
 
-    # ---- Tab 2: Enhanced Knowledge Base Management ----
+    # ---- Tab 2: Knowledge Base Management ----
     with tab2:
-        st.header("🧠 Enhanced Knowledge Base Management")
+        st.header("🧠 Knowledge Base Management")
         
         kb = RAGKnowledgeBase(st.session_state.rag_db_path)
         stats = kb.get_stats()
         
-        # Display enhanced stats
+        # Display stats
         if not stats.get("error"):
-            col1, col2, col3, col4 = st.columns(4)
+            col1, col2, col3 = st.columns(3)
             with col1:
                 st.metric("📚 Total Documents", stats["total_documents"])
             with col2:
                 st.metric("📄 Total Chunks", stats["total_chunks"])
             with col3:
                 st.metric("💬 Chat Sessions", stats["total_chat_sessions"])
-            with col4:
-                missing = stats.get("missing_embeddings", 0)
-                st.metric("⚠️ Missing Embeddings", missing, delta="Need re-indexing" if missing > 0 else "All indexed")
-        
-        # Management buttons
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            if st.button("🔄 Re-index Documents", help="Re-create embeddings for documents"):
-                with st.spinner("Re-indexing documents..."):
-                    success = kb.reindex_documents()
-                    if success:
-                        st.success("✅ Re-indexing completed!")
-                        st.rerun()
-        
-        with col2:
-            # Two-step confirmation for reset
-            if 'reset_confirm' not in st.session_state:
-                st.session_state.reset_confirm = False
-            
-            if not st.session_state.reset_confirm:
-                if st.button("🗑️ Reset Knowledge Base", help="⚠️ This will delete all documents!"):
-                    st.session_state.reset_confirm = True
-                    st.rerun()
-            else:
-                st.warning("⚠️ This will permanently delete all documents and chat history!")
-                col_confirm, col_cancel = st.columns(2)
-                with col_confirm:
-                    if st.button("✅ Confirm Reset", type="primary"):
-                        if kb.reset_knowledge_base():
-                            st.success("✅ Knowledge base reset successfully!")
-                            st.session_state.reset_confirm = False
-                            st.session_state.chat_history = []
-                            st.rerun()
-                        else:
-                            st.error("❌ Failed to reset knowledge base")
-                with col_cancel:
-                    if st.button("❌ Cancel"):
-                        st.session_state.reset_confirm = False
-                        st.rerun()
-        
-        with col3:
-            # Export knowledge base
-            if st.button("💾 Export Knowledge Base", help="Export all documents as markdown"):
-                try:
-                    conn = sqlite3.connect(st.session_state.rag_db_path)
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT filename, content, heading FROM documents ORDER BY filename, chunk_id")
-                    
-                    export_content = "# Knowledge Base Export\n\n"
-                    current_file = None
-                    
-                    for filename, content, heading in cursor.fetchall():
-                        if filename != current_file:
-                            export_content += f"\n---\n\n# 📄 {filename}\n\n"
-                            current_file = filename
-                        
-                        export_content += f"{content}\n\n"
-                    
-                    conn.close()
-                    
-                    st.download_button(
-                        "📦 Download Export",
-                        export_content,
-                        "knowledge_base_export.md",
-                        "text/markdown"
-                    )
-                except Exception as e:
-                    st.error(f"❌ Export failed: {str(e)}")
         
         st.markdown("---")
         
@@ -1636,8 +1313,7 @@ def main():
             "Upload Markdown files",
             type=['md', 'txt'],
             accept_multiple_files=True,
-            help="Upload .md or .txt files to add to knowledge base",
-            key="kb_upload"
+            help="Upload .md or .txt files to add to knowledge base"
         )
         
         if markdown_files and st.button("➕ Add Markdown Files"):
@@ -1665,7 +1341,7 @@ def main():
             doc_content = st.text_area(
                 "Document Content",
                 height=200,
-                placeholder="Paste or type your document content here...\n\n# Use markdown formatting\n## For better organization"
+                placeholder="Paste or type your document content here..."
             )
             
             submitted = st.form_submit_button("➕ Add to Knowledge Base")
@@ -1680,116 +1356,58 @@ def main():
         
         st.markdown("---")
         
-        # Enhanced knowledge base browser
+        # Knowledge base browser
         st.subheader("📖 Browse Knowledge Base")
         
         if stats.get("total_documents", 0) > 0:
-            # Search within knowledge base
-            search_query = st.text_input("🔍 Search documents:", placeholder="Search within your knowledge base...")
-            
             # Get document list
             conn = sqlite3.connect(st.session_state.rag_db_path)
             cursor = conn.cursor()
-            
-            if search_query:
-                # Simple text search for now
-                cursor.execute("""
-                    SELECT DISTINCT filename, COUNT(*) as chunk_count, MAX(created_at) as latest 
-                    FROM documents 
-                    WHERE content LIKE ? OR heading LIKE ? 
-                    GROUP BY filename 
-                    ORDER BY latest DESC
-                """, (f"%{search_query}%", f"%{search_query}%"))
-            else:
-                cursor.execute("""
-                    SELECT DISTINCT filename, COUNT(*) as chunk_count, MAX(created_at) as latest 
-                    FROM documents 
-                    GROUP BY filename 
-                    ORDER BY latest DESC
-                """)
-            
+            cursor.execute("SELECT DISTINCT filename, COUNT(*) as chunk_count, MAX(created_at) as latest FROM documents GROUP BY filename ORDER BY latest DESC")
             docs = cursor.fetchall()
             conn.close()
             
-            # Display documents with enhanced info
+            # Display documents
             for filename, chunk_count, created_at in docs:
-                with st.expander(f"📄 {filename} ({chunk_count} chunks) - {created_at}"):
-                    # Get document chunks with headings
-                    conn = sqlite3.connect(st.session_state.rag_db_path)
-                    cursor = conn.cursor()
-                    cursor.execute("""
-                        SELECT content, heading, content_type 
-                        FROM documents 
-                        WHERE filename = ? 
-                        ORDER BY chunk_id
-                    """, (filename,))
-                    chunks = cursor.fetchall()
-                    conn.close()
-                    
-                    st.write(f"**File:** {filename}")
-                    st.write(f"**Chunks:** {chunk_count}")
+                with st.expander(f"📄 {filename} ({chunk_count} chunks)"):
                     st.write(f"**Created:** {created_at}")
-                    
-                    # Show chunk organization
-                    headings = list(set([chunk[1] for chunk in chunks if chunk[1]]))
-                    if headings:
-                        st.write(f"**Sections:** {', '.join(headings[:5])}")
-                        if len(headings) > 5:
-                            st.write(f"... and {len(headings) - 5} more sections")
+                    st.write(f"**Chunks:** {chunk_count}")
                     
                     # Show first chunk as preview
-                    if chunks:
+                    conn = sqlite3.connect(st.session_state.rag_db_path)
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT content FROM documents WHERE filename = ? LIMIT 1", (filename,))
+                    preview = cursor.fetchone()
+                    if preview:
                         st.write("**Preview:**")
-                        preview_content = chunks[0][0]
-                        st.text(preview_content[:300] + "..." if len(preview_content) > 300 else preview_content)
+                        st.text(preview[0][:200] + "..." if len(preview[0]) > 200 else preview[0])
+                    conn.close()
                     
-                    # Action buttons
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        if st.button(f"🔍 View Full Content", key=f"view_{filename}"):
-                            full_content = "\n\n---\n\n".join([chunk[0] for chunk in chunks])
-                            st.text_area(f"Full content of {filename}:", full_content, height=400)
-                    
-                    with col2:
-                        if st.button(f"🗑️ Delete {filename}", key=f"del_{filename}"):
-                            conn = sqlite3.connect(st.session_state.rag_db_path)
-                            cursor = conn.cursor()
-                            cursor.execute("DELETE FROM documents WHERE filename = ?", (filename,))
-                            conn.commit()
-                            conn.close()
-                            st.success(f"✅ Deleted {filename}")
-                            st.rerun()
+                    # Delete button
+                    if st.button(f"🗑️ Delete {filename}", key=f"del_{filename}"):
+                        conn = sqlite3.connect(st.session_state.rag_db_path)
+                        cursor = conn.cursor()
+                        cursor.execute("DELETE FROM documents WHERE filename = ?", (filename,))
+                        conn.commit()
+                        conn.close()
+                        st.success(f"✅ Deleted {filename}")
+                        st.rerun()
         else:
             st.info("📝 No documents in knowledge base yet. Add some documents to get started!")
 
-    # ---- Tab 3: Enhanced AI Chat with RAG ----
+    # ---- Tab 3: AI Chat with RAG ----
     with tab3:
-        st.header("💬 Enhanced AI Chat with Knowledge Base")
+        st.header("💬 AI Chat with Knowledge Base")
         
         # Check if knowledge base has content
         if stats.get("total_documents", 0) == 0:
             st.warning("⚠️ No documents in knowledge base. Please add documents in the Knowledge Base tab first.")
             return
         
-        # Chat model selection
-        col1, col2, col3 = st.columns([2, 1, 1])
-        with col1:
-            chat_model = st.selectbox(
-                "🤖 Chat Model:",
-                ["qwen2.5:14b", "scb10x/llama3.1-typhoon2-8b-instruct:latest", "nomic-embed-text:latest"],
-                format_func=lambda x: f"{AVAILABLE_MODELS[x]['icon']} {AVAILABLE_MODELS[x]['name']}",
-                help="Select model for generating responses"
-            )
-        
-        with col2:
-            use_mmr = st.checkbox("🎯 Use MMR Search", value=True, help="Reduces redundancy in search results")
-        
-        with col3:
-            min_similarity = st.slider("🎚️ Min Similarity", 0.0, 1.0, 0.3, 0.05, help="Minimum similarity threshold for relevant documents")
-        
+        # Chat interface
         st.subheader("🗣️ Ask Questions About Your Documents")
         
-        # Display enhanced chat history
+        # Display chat history
         for i, (question, answer, context) in enumerate(st.session_state.chat_history):
             # User message
             st.markdown(f"""
@@ -1799,80 +1417,38 @@ def main():
             </div>
             """, unsafe_allow_html=True)
             
-            # Check if this is a rejection response
-            is_rejection = "ไม่พบข้อมูลที่เกี่ยวข้อง" in answer or "ขออภัย" in answer
-            
-            # Assistant message with appropriate styling
-            message_class = "rejection-message" if is_rejection else "assistant-message"
+            # Assistant message
             st.markdown(f"""
-            <div class="chat-message {message_class}">
+            <div class="chat-message assistant-message">
                 <strong>🤖 Assistant:</strong><br>
                 {answer}
             </div>
             """, unsafe_allow_html=True)
             
-            # Show context sources with enhanced info
-            if context and not is_rejection:
+            # Show context sources
+            if context:
                 with st.expander(f"📚 Sources (Chat {i+1})", expanded=False):
-                    for j, source in enumerate(context):
-                        if len(source) >= 5:  # New format with heading and content_type
-                            filename, content, similarity, heading, content_type = source[:5]
-                            st.markdown(f"""
-                            <div class="knowledge-card">
-                                <strong>📄 {filename}</strong> → <em>{heading}</em> ({content_type})<br>
-                                <strong>Similarity:</strong> {similarity:.1%}<br>
-                                <strong>Content:</strong> {content[:200]}...
-                            </div>
-                            """, unsafe_allow_html=True)
-                        else:  # Fallback for old format
-                            filename, content, similarity = source[:3]
-                            st.markdown(f"""
-                            <div class="knowledge-card">
-                                <strong>📄 {filename}</strong> (Similarity: {similarity:.1%})<br>
-                                <em>{content[:200]}...</em>
-                            </div>
-                            """, unsafe_allow_html=True)
+                    for j, (filename, content, similarity) in enumerate(context):
+                        st.markdown(f"""
+                        <div class="knowledge-card">
+                            <strong>📄 {filename}</strong> (Similarity: {similarity:.3f})<br>
+                            <em>{content[:200]}...</em>
+                        </div>
+                        """, unsafe_allow_html=True)
         
-        # Enhanced chat input with suggestions
-        st.markdown("---")
-        
-        # Sample questions
-        if not st.session_state.chat_history:
-            st.write("**💡 Sample Questions:**")
-            sample_questions = [
-                "สรุปเนื้อหาหลักของเอกสารทั้งหมด",
-                "มีข้อมูลเกี่ยวกับ [หัวข้อที่สนใจ] หรือไม่",
-                "เปรียบเทียบข้อมูลระหว่างเอกสารต่าง ๆ",
-                "แสดงรายการสิ่งที่สำคัญจากเอกสาร"
-            ]
-            
-            cols = st.columns(2)
-            for i, question in enumerate(sample_questions):
-                with cols[i % 2]:
-                    if st.button(f"💬 {question}", key=f"sample_{i}"):
-                        st.session_state.suggested_question = question
-                        st.rerun()
-        
-        # Chat input form
-        with st.form("enhanced_chat_form", clear_on_submit=True):
-            default_question = st.session_state.get('suggested_question', '')
-            if default_question:
-                del st.session_state.suggested_question
-            
+        # Chat input
+        with st.form("chat_form", clear_on_submit=True):
             user_question = st.text_input(
                 "Ask a question:",
-                value=default_question,
                 placeholder="What would you like to know about your documents?",
-                key="enhanced_chat_input"
+                key="chat_input"
             )
             
-            col1, col2, col3, col4 = st.columns([1, 1, 1, 3])
+            col1, col2, col3 = st.columns([1, 1, 4])
             with col1:
                 ask_button = st.form_submit_button("🚀 Ask")
             with col2:
                 clear_button = st.form_submit_button("🗑️ Clear Chat")
-            with col3:
-                debug_button = st.form_submit_button("🔍 Debug Search")
             
             if clear_button:
                 st.session_state.chat_history = []
@@ -1880,43 +1456,36 @@ def main():
         
         if ask_button and user_question:
             with st.spinner("🔍 Searching knowledge base and generating response..."):
-                # Enhanced search with MMR
-                context_docs = kb.search_similar(user_question, top_k=5, use_mmr=use_mmr)
+                # Search for relevant context
+                context_docs = kb.search_similar(user_question, top_k=5)
                 
                 if context_docs:
-                    # Generate enhanced RAG response
+                    # Generate RAG response
                     response = generate_rag_response(
                         user_question, 
                         context_docs, 
-                        chat_model,
-                        min_similarity
+                        selected_model
                     )
                     
                     if response:
-                        # Add to chat history with enhanced context
+                        # Add to chat history
                         st.session_state.chat_history.append((
                             user_question,
                             response,
                             context_docs[:3]  # Store top 3 for context
                         ))
                         
-                        # Save to database with enhanced metadata
+                        # Save to database
                         conn = sqlite3.connect(st.session_state.rag_db_path)
                         cursor = conn.cursor()
                         cursor.execute('''
                             INSERT INTO chat_sessions (session_id, question, answer, context)
                             VALUES (?, ?, ?, ?)
                         ''', (
-                            "enhanced_session",
+                            "default",  # Simple session management
                             user_question,
                             response,
-                            json.dumps([{
-                                "filename": doc[0], 
-                                "content": doc[1][:200], 
-                                "similarity": doc[2],
-                                "heading": doc[3] if len(doc) > 3 else "Unknown",
-                                "content_type": doc[4] if len(doc) > 4 else "paragraph"
-                            } for doc in context_docs[:3]])
+                            json.dumps([(doc[0], doc[1][:200], doc[2]) for doc in context_docs[:3]])
                         ))
                         conn.commit()
                         conn.close()
@@ -1926,34 +1495,10 @@ def main():
                         st.error("❌ Failed to generate response")
                 else:
                     st.warning("⚠️ No relevant information found in knowledge base")
-        
-        if debug_button and user_question:
-            with st.expander("🔍 Debug Search Results", expanded=True):
-                st.write(f"**Query:** {user_question}")
-                st.write(f"**Search Method:** {'MMR' if use_mmr else 'Cosine Similarity'}")
-                st.write(f"**Minimum Similarity:** {min_similarity}")
-                
-                context_docs = kb.search_similar(user_question, top_k=10, use_mmr=use_mmr)
-                
-                if context_docs:
-                    for i, doc in enumerate(context_docs):
-                        filename, content, similarity = doc[:3]
-                        heading = doc[3] if len(doc) > 3 else "Unknown"
-                        content_type = doc[4] if len(doc) > 4 else "paragraph"
-                        
-                        color = "green" if similarity >= min_similarity else "red"
-                        st.markdown(f"""
-                        **Result {i+1}:** `{filename}` → `{heading}` ({content_type})  
-                        **Similarity:** <span style="color: {color}">{similarity:.1%}</span>  
-                        **Content:** {content[:150]}...
-                        """, unsafe_allow_html=True)
-                        st.markdown("---")
-                else:
-                    st.warning("No results found")
 
-    # ---- Tab 4: Enhanced Features ----
+    # ---- Tab 4: Features ----
     with tab4:
-        st.header("✨ Enhanced RAG Features")
+        st.header("✨ Enhanced Features with RAG")
         
         # Enhanced feature cards
         features = [
@@ -1965,44 +1510,40 @@ def main():
                     "Thai-English OCR with high accuracy",
                     "Complex document structure recognition", 
                     "Batch processing for multiple files",
-                    "Multiple output formats (MD, HTML, JSON)",
-                    "Automatic quality optimization"
+                    "Multiple output formats (MD, HTML, JSON)"
                 ]
             },
             {
                 "icon": "🧠", 
-                "title": "Intelligent RAG System",
-                "description": "ระบบค้นหาและตอบคำถามที่ฉลาด",
+                "title": "RAG Knowledge Base",
+                "description": "สร้างฐานความรู้และค้นหาข้อมูลอัจฉริยะ",
                 "items": [
-                    "Smart markdown chunking with heading preservation",
-                    "MMR search to reduce redundancy",
-                    "Configurable similarity thresholds",
-                    "Enhanced context attribution",
-                    "Strict rejection of irrelevant queries"
+                    "Auto-import OCR results to knowledge base",
+                    "Manual markdown document upload",
+                    "Intelligent text chunking and embedding",
+                    "Semantic search with similarity scoring"
                 ]
             },
             {
                 "icon": "💬",
-                "title": "Enhanced AI Chat",
-                "description": "ถามตอบอัจฉริยะที่ปรับปรุงแล้ว",
+                "title": "AI-Powered Q&A",
+                "description": "ถามตอบกับเอกสารด้วย AI",
                 "items": [
-                    "Multiple model support with specializations",
-                    "Source attribution with section headers",
-                    "Debug mode for search analysis",
-                    "Context-aware response generation",
-                    "Conversation history with metadata"
+                    "Context-aware responses from your documents",
+                    "Multi-language support (Thai-English)",
+                    "Source attribution and transparency",
+                    "Chat history and session management"
                 ]
             },
             {
-                "icon": "🛠️",
-                "title": "Advanced Management", 
-                "description": "จัดการข้อมูลและระบบอย่างครอบคลุม",
+                "icon": "📊",
+                "title": "Document Analytics", 
+                "description": "วิเคราะห์และจัดการเอกสารอย่างครอบคลุม",
                 "items": [
-                    "Re-indexing capabilities for updated settings",
-                    "Two-step confirmation for destructive actions",
-                    "Knowledge base export functionality",
-                    "Enhanced document browsing with search",
-                    "Performance monitoring and statistics"
+                    "Processing performance metrics",
+                    "Knowledge base statistics",
+                    "Document similarity analysis",
+                    "Content organization and retrieval"
                 ]
             }
         ]
@@ -2011,14 +1552,14 @@ def main():
             st.markdown(f"""
             <div class="feature-card">
                 <h3>{feature['icon']} {feature['title']}</h3>
-                <p><strong>{feature['description']}</strong></p>
+                <p>{feature['description']}</p>
                 <ul>
-                    {' '.join([f'<li>✅ {item}</li>' for item in feature['items']])}
+                    {' '.join([f'<li>✓ {item}</li>' for item in feature['items']])}
                 </ul>
             </div>
             """, unsafe_allow_html=True)
         
-        # Enhanced workflow
+        # Workflow diagram
         st.subheader("🔄 Enhanced Workflow")
         st.markdown("""
         ```mermaid
@@ -2026,428 +1567,237 @@ def main():
             A[📄 Upload Document] --> B[🌪️ OCR Processing]
             B --> C[📝 Extract Text/Markdown]
             C --> D{Add to Knowledge Base?}
-            D -->|Yes| E[🧠 Intelligent Chunking]
-            E --> F[🔍 Create Embeddings]
-            F --> G[💾 Store with Metadata]
-            D -->|No| H[💾 Download Results]
-            G --> I[💬 Enhanced AI Chat]
-            I --> J[🎯 MMR Search]
-            J --> K[🤖 Context-Aware Response]
-            K --> L[📚 Source Attribution]
+            D -->|Yes| E[🧠 Store in RAG DB]
+            D -->|No| F[💾 Download Results]
+            E --> G[💬 AI Chat Ready]
+            G --> H[🔍 Ask Questions]
+            H --> I[🤖 Context-Aware Answers]
             
-            M[📤 Manual Upload] --> E
-            N[✍️ Direct Input] --> E
-            O[🔄 Re-index] --> F
-            P[🗑️ Reset KB] --> Q[⚠️ Confirm]
+            J[📤 Manual Upload] --> E
+            K[✍️ Direct Input] --> E
         ```
         """)
         
-        # Enhanced model comparison
-        st.subheader("⚡ Model Performance & Specialization")
+        # Performance comparison
+        st.subheader("⚡ Model Performance Comparison")
         
         performance_data = {
-            "Model": ["Typhoon OCR 7B", "Qwen2.5 14B", "Typhoon2 8B", "Nomic Embed"],
-            "Thai OCR": ["⭐⭐⭐⭐⭐", "⭐⭐⭐", "⭐⭐⭐⭐", "N/A"],
-            "English OCR": ["⭐⭐⭐⭐⭐", "⭐⭐⭐⭐⭐", "⭐⭐⭐⭐", "N/A"],
-            "Complex Tables": ["⭐⭐⭐⭐⭐", "⭐⭐⭐⭐", "⭐⭐⭐", "N/A"],
-            "Thai Q&A": ["⭐⭐⭐⭐", "⭐⭐⭐⭐", "⭐⭐⭐⭐⭐", "N/A"],
-            "Processing Speed": ["⭐⭐⭐⭐", "⭐⭐", "⭐⭐⭐⭐", "⭐⭐⭐⭐⭐"],
-            "Embedding Quality": ["N/A", "N/A", "N/A", "⭐⭐⭐⭐⭐"],
-            "Best For": ["OCR Tasks", "Complex Reasoning", "Thai Content", "Embeddings"]
+            "Model": ["Typhoon OCR 7B", "Qwen2.5 14B", "Typhoon2 8B"],
+            "Thai OCR": ["⭐⭐⭐⭐⭐", "⭐⭐⭐", "⭐⭐⭐⭐"],
+            "English OCR": ["⭐⭐⭐⭐⭐", "⭐⭐⭐⭐⭐", "⭐⭐⭐⭐"],
+            "Complex Tables": ["⭐⭐⭐⭐⭐", "⭐⭐⭐⭐", "⭐⭐⭐"],
+            "Thai Q&A": ["⭐⭐⭐⭐", "⭐⭐⭐⭐", "⭐⭐⭐⭐⭐"],
+            "Processing Speed": ["⭐⭐⭐⭐", "⭐⭐", "⭐⭐⭐⭐"],
+            "Best For": ["OCR Tasks", "RAG Q&A", "Thai Content"]
         }
         
         st.table(performance_data)
         
-        # RAG System Benefits
-        st.subheader("🎯 Enhanced RAG Benefits")
+        # RAG Benefits
+        st.subheader("🎯 RAG System Benefits")
         
         col1, col2 = st.columns(2)
         
         with col1:
             st.markdown("""
-            **🧠 Intelligent Processing:**
-            - Markdown-aware chunking preserves document structure
-            - Section headers maintained for better context
-            - Configurable chunk sizes with overlap optimization
-            - Smart embedding generation with retry logic
+            **📚 Knowledge Management:**
+            - Persistent document storage
+            - Intelligent text chunking
+            - Semantic search capabilities
+            - Multi-document correlation
             
-            **🔍 Advanced Search:**
-            - MMR (Maximal Marginal Relevance) reduces redundancy
-            - Similarity threshold filtering
-            - Debug mode for search result analysis
-            - Multi-criteria ranking system
+            **🔍 Smart Retrieval:**
+            - Context-aware responses
+            - Source attribution
+            - Similarity scoring
+            - Multi-language support
             """)
         
         with col2:
             st.markdown("""
-            **🤖 Enhanced Responses:**
-            - Strict relevance checking prevents hallucination
-            - Source attribution with section information
-            - Multiple model support for specialized tasks
-            - Context-aware response generation
+            **⚡ Efficiency Gains:**
+            - Instant document lookup
+            - Automated knowledge base building
+            - Batch processing integration
+            - Scalable architecture
             
-            **🛠️ Management Tools:**
-            - Re-indexing for updated configurations
-            - Export functionality for backup
-            - Enhanced browsing with search
-            - Performance monitoring and statistics
+            **🎯 Use Cases:**
+            - Corporate document Q&A
+            - Research paper analysis
+            - Legal document review
+            - Technical documentation
             """)
-        
-        # Use case examples
-        st.subheader("🎯 Advanced Use Cases")
-        
-        use_cases = [
-            {
-                "title": "📊 Research Analysis",
-                "description": "Upload multiple research papers and ask comparative questions",
-                "example": "\"Compare the methodologies used in papers A and B\""
-            },
-            {
-                "title": "📋 Policy Documentation",
-                "description": "Create a searchable policy database with instant Q&A",
-                "example": "\"What are the requirements for employee vacation requests?\""
-            },
-            {
-                "title": "📚 Educational Content",
-                "description": "Build interactive learning materials with instant explanations",
-                "example": "\"Explain the concept of photosynthesis from the biology textbook\""
-            },
-            {
-                "title": "⚖️ Legal Document Review",
-                "description": "Quick reference and analysis of legal documents",
-                "example": "\"What are the termination clauses in the employment contract?\""
-            }
-        ]
-        
-        for i, use_case in enumerate(use_cases):
-            with st.expander(f"{use_case['title']}: {use_case['description']}"):
-                st.write(f"**Example Query:** {use_case['example']}")
-                st.write("**Features Used:**")
-                st.write("- Smart document chunking preserves structure")
-                st.write("- MMR search ensures diverse, relevant results")  
-                st.write("- Source attribution shows exact references")
-                st.write("- Strict relevance filtering prevents false information")
 
-    # ---- Tab 5: Enhanced User Guide ----
+    # ---- Tab 5: User Guide ----
     with tab5:
-        st.header("📖 คู่มือการใช้งาน Typhoon OCR with Enhanced RAG")
+        st.header("📖 คู่มือการใช้งาน Typhoon OCR with RAG")
         
         st.markdown("""
-## 🌟 ภาพรวมระบบที่ปรับปรุงใหม่
+## 🌟 ภาพรวมระบบที่ปรับปรุงแล้ว
 
-Typhoon OCR with Enhanced RAG เป็นระบบที่ได้รับการปรับปรุงให้มีความสามารถที่ก้าวหน้ายิ่งขึ้น:
+Typhoon OCR with RAG เป็นระบบที่รวม **OCR ขั้นสูง** กับ **RAG (Retrieval-Augmented Generation)** เพื่อให้คุณสามารถ:
 
-### 🆕 **ฟีเจอร์ใหม่ที่เพิ่มเข้ามา:**
-- 🧠 **Smart Markdown Chunking**: แบ่งชิ้นเอกสารแบบเก็บหัวข้อไว้
-- 🎯 **MMR Search**: ค้นหาแบบลดความซ้ำซ้อน  
-- ⚙️ **Configurable Settings**: ตั้งค่า chunk size และ overlap ได้
-- 🔄 **Re-indexing**: สร้าง embeddings ใหม่เมื่อเปลี่ยนการตั้งค่า
-- 🗑️ **Safe Reset**: ลบข้อมูลแบบยืนยัน 2 ชั้น
-- 📊 **Enhanced Analytics**: สถิติและการวิเคราะห์ที่ละเอียดขึ้น
+1. **📄 ประมวลผลเอกสาร** - แปลง PDF/รูปภาพเป็นข้อความ
+2. **🧠 สร้างฐานความรู้** - เก็บข้อมูลอย่างเป็นระบบ
+3. **💬 ถามตอบอัจฉริยะ** - ค้นหาและตอบคำถามจากเอกสาร
 
 ---
 
-## 🔄 ขั้นตอนการใช้งานแบบปรับปรุงใหม่
+## 🔄 ขั้นตอนการใช้งานแบบครบวงจร
 
-### ขั้นตอนที่ 1: การตั้งค่าระบบ RAG
-1. **ไปที่ Sidebar → RAG Configuration**
-2. **ปรับ Chunk Size**: ขนาดชิ้นข้อความ (แนะนำ 1000-1500)
-3. **ปรับ Chunk Overlap**: ความซ้อนทับ (แนะนำ 200-300)
-4. **หากเปลี่ยนการตั้งค่า**: ใช้ปุ่ม "Re-index" ใน Knowledge Base tab
-
-### ขั้นตอนที่ 2: OCR Processing (เหมือนเดิม)
+### ขั้นตอนที่ 1: OCR Processing
 1. **เปิดแท็บ "📁 Upload & OCR"**
 2. **อัพโหลดไฟล์** (PDF, PNG, JPG, JPEG)
 3. **ตั้งค่าพารามิเตอร์** ตามต้องการ
 4. **กดปุ่ม "🚀 Process Document(s)"**
 5. **รอผลลัพธ์** และตรวจสอบความแม่นยำ
 
-### ขั้นตอนที่ 3: Enhanced Knowledge Management
-หลังจาก OCR เสร็จแล้ว มี **4 วิธี** ในการจัดการ Knowledge Base:
+### ขั้นตอนที่ 2: เพิ่มเข้า Knowledge Base
+หลังจาก OCR เสร็จแล้ว มี **3 วิธี** ในการเพิ่มข้อมูลเข้า Knowledge Base:
 
 #### 🔹 วิธีที่ 1: Auto-add จากผล OCR
 - หลังจาก OCR เสร็จ จะมีปุ่ม **"🧠 Add to Knowledge Base"**
-- ระบบจะใช้ **Smart Chunking** แบ่งข้อความตามหัวข้อ Markdown
+- กดปุ่มนี้เพื่อเพิ่มข้อมูลโดยอัตโนมัติ
 
-#### 🔹 วิธีที่ 2: Upload Markdown Files (แนะนำ)
+#### 🔹 วิธีที่ 2: Upload Markdown Files
 - ไปที่แท็บ **"🧠 Knowledge Base"**
-- อัพโหลดไฟล์ .md ที่จัดรูปแบบด้วย headers (# ## ###)
-- ระบบจะแยกตามหัวข้อโดยอัตโนมัติ
+- ในส่วน **"Method 1: Upload Markdown Files"**
+- อัพโหลดไฟล์ .md หรือ .txt
+- กดปุ่ม **"➕ Add Markdown Files"**
 
 #### 🔹 วิธีที่ 3: Direct Text Input
+- ในส่วน **"Method 2: Direct Text Input"**
 - ใส่ชื่อเอกสารและเนื้อหา
-- **แนะนำ**: ใช้ Markdown format เพื่อการแบ่ง chunk ที่ดี
-- ตัวอย่าง:
-```markdown
-# หัวข้อหลัก
-## หัวข้อย่อย 1
-เนื้อหาส่วนแรก...
+- กดปุ่ม **"➕ Add to Knowledge Base"**
 
-## หัวข้อย่อย 2  
-เนื้อหาส่วนที่สอง...
-```
-
-#### 🔹 วิธีที่ 4: Management Tools
-- **🔄 Re-index Documents**: สร้าง embeddings ใหม่
-- **🗑️ Reset Knowledge Base**: ลบข้อมูลทั้งหมด (ยืนยัน 2 ชั้น)
-- **💾 Export Knowledge Base**: ส่งออกเป็นไฟล์ Markdown
-- **🔍 Search Documents**: ค้นหาในเอกสารที่มีอยู่
-
-### ขั้นตอนที่ 4: Enhanced AI Chat
+### ขั้นตอนที่ 3: ถามตอบด้วย AI
 1. **ไปที่แท็บ "💬 AI Chat"**
-2. **เลือกโมเดล**:
-   - **Qwen2.5 14B**: วิเคราะห์ซับซ้อน ภาษาอังกฤษ
-   - **Typhoon2 8B**: เหมาะสำหรับภาษาไทย
-   - **Nomic Embed**: สำหรับการค้นหาเฉพาะ
-3. **ตั้งค่า Search**:
-   - ✅ **Use MMR Search**: ลดความซ้ำซ้อนในผลลัพธ์
-   - **Min Similarity**: กรองเอกสารที่ไม่เกี่ยวข้อง (แนะนำ 0.3)
-4. **พิมพ์คำถาม** และ **กดปุ่ม "🚀 Ask"**
-5. **ใช้ Debug Mode** เพื่อดูผลการค้นหาแบบละเอียด
+2. **พิมพ์คำถาม** ในช่อง "Ask a question"
+3. **กดปุ่ม "🚀 Ask"**
+4. **รอคำตอบ** พร้อมแหล่งอ้างอิง
 
 ---
 
-## 🎯 เทคนิคการใช้งานขั้นสูง
+## 🎯 เทคนิคการตั้งค่าพารามิเตอร์
 
-### 📊 การตั้งค่าที่เหมาะสมสำหรับแต่ละประเภท
+### 📊 สำหรับ OCR (การแปลงเอกสาร)
+- **Temperature: 0.1** → ความแม่นยำสูงสุด
+- **Top P: 0.6** → สมดุลที่ดีที่สุด
+- **Model: Typhoon OCR 7B** → เชี่ยวชาญด้าน OCR
 
-#### 🔹 เอกสารสั้น (1-5 หน้า):
-- **Chunk Size**: 800-1000
-- **Overlap**: 150-200  
-- **Min Similarity**: 0.4-0.5
-
-#### 🔹 เอกสารยาว (10+ หน้า):
-- **Chunk Size**: 1200-1500
-- **Overlap**: 250-300
-- **Min Similarity**: 0.3-0.4
-
-#### 🔹 เอกสารเทคนิค (คู่มือ, กฎหมาย):
-- **Chunk Size**: 1000-1200
-- **Overlap**: 200-250
-- **Min Similarity**: 0.3
-- **MMR**: เปิดใช้งานเสมอ
-
-#### 🔹 เอกสารการวิจัย (บทความ, รายงาน):
-- **Chunk Size**: 1500-2000  
-- **Overlap**: 300-400
-- **Min Similarity**: 0.25
-- **Model**: Qwen2.5 14B
-
-### 🧠 เทคนิค Markdown Chunking
-
-ระบบใหม่จะแบ่ง chunk ตามโครงสร้าง Markdown:
-
-```markdown
-# หัวข้อใหญ่ (จะเป็น chunk แยก)
-เนื้อหาส่วนแรก...
-
-## หัวข้อย่อย A (chunk ใหม่)
-รายละเอียดของ A...
-
-### หัวข้อย่อยของ A (ถ้าเนื้อหาเยอะจะแยก chunk)
-รายละเอียดเพิ่มเติม...
-
-## หัวข้อย่อย B (chunk ใหม่)  
-รายละเอียดของ B...
-```
-
-**ข้อดี**:
-- ✅ เก็บบริบทของหัวข้อไว้
-- ✅ ค้นหาแม่นยำขึ้น
-- ✅ อ้างอิงแหล่งที่มาชัดเจน
-
-### 🔍 เทคนิค MMR Search
-
-**MMR (Maximal Marginal Relevance)** ช่วยลดความซ้ำซ้อน:
-
-**เปิดใช้เมื่อ**:
-- ✅ เอกสารหลายชิ้นที่คล้ายกัน
-- ✅ ต้องการมุมมองหลากหลาย
-- ✅ คำถามที่กว้าง เช่น "สรุปทั้งหมด"
-
-**ปิดใช้เมื่อ**:
-- ❌ ต้องการข้อมูลที่เฉพาะเจาะจง
-- ❌ เอกสารมีเนื้อหาที่แตกต่างกันมาก
-- ❌ คำถามที่ระบุชัดเจน
-
-### 💬 เทคนิคการถามคำถามขั้นสูง
-
-#### 🎯 **คำถามที่มีประสิทธิภาพ**:
-1. **ระบุบริบท**: "จากเอกสารเรื่องการเงิน มีกำไรเท่าไหร่"
-2. **ขอการเปรียบเทียบ**: "เปรียบเทียบวิธีการ A และ B"  
-3. **ขอรายการ**: "จงแสดงขั้นตอนการ..."
-4. **ระบุช่วงเวลา**: "ในไตรมาสแรก มียอดขายเท่าไหร่"
-
-#### ❌ **คำถามที่ควรหลีกเลี่ยง**:
-- คำถามที่กว้างเกินไป: "เอกสารนี้พูดถึงอะไร"
-- คำถามที่ไม่เกี่ยวกับเอกสาร: "อากาศวันนี้เป็นยังไง"
-- คำถามที่ต้องการข้อมูลนอกเอกสาร
-
-### 🔧 การแก้ปัญหาขั้นสูง
-
-#### ⚠️ **เมื่อไม่พบข้อมูลที่เกี่ยวข้อง**:
-1. **ลดค่า Min Similarity** จาก 0.3 เป็น 0.2
-2. **ใช้คำถามที่กว้างขึ้น**
-3. **ตรวจสอบว่าเพิ่มเอกสารที่เกี่ยวข้องแล้ว**
-4. **ใช้ Debug Mode ดูผลการค้นหา**
-
-#### 🔄 **เมื่อเปลี่ยนการตั้งค่า Chunk**:
-1. **บันทึกเอกสารสำคัญ** (Export ก่อน)
-2. **ใช้ปุ่ม "Re-index Documents"**  
-3. **หรือ Reset KB และเพิ่มเอกสารใหม่**
-
-#### 🐛 **Debug Mode การใช้งาน**:
-- ดู **Similarity Score** ของแต่ละผลลัพธ์
-- ตรวจสอบว่า **Search Method** เป็น MMR หรือ Cosine
-- เปรียบเทียบ **ผลลัพธ์ที่ผ่าน** และ **ไม่ผ่าน threshold**
+### 💬 สำหรับ Q&A (การถามตอบ)
+- **Temperature: 0.3** → ความสมดุลระหว่างแม่นยำและสร้างสรรค์
+- **Model: Qwen2.5 14B** → เหมาะสำหรับการวิเคราะห์และตอบคำถาม
+- **Model: Typhoon2 8B** → ดีที่สุดสำหรับภาษาไทย
 
 ---
 
-## 🚀 Workflow แนะนำสำหรับการใช้งานจริง
+## 🧠 RAG Knowledge Base คืออะไร?
 
-### 📅 **วันแรก: Setup ระบบ**
-1. ปรับการตั้งค่า RAG ตามประเภทเอกสาร
-2. อัพโหลดเอกสารสำคัญทั้งหมด
-3. ทดสอบคำถามพื้นฐาน
-4. Export ข้อมูลเป็น backup
+**RAG (Retrieval-Augmented Generation)** เป็นเทคโนโลยีที่ช่วยให้ AI สามารถ:
 
-### 📊 **ทุกสัปดาห์: Maintenance**
-1. เพิ่มเอกสารใหม่
-2. ทดสอบคำถามที่ซับซ้อนขึ้น
-3. ตรวจสอบสถิติและประสิทธิภาพ
-4. ลบเอกสารที่ไม่จำเป็น
+### 🔍 การทำงานของ RAG:
+1. **จัดเก็บข้อมูล** → แบ่งเอกสารเป็นชิ้นเล็ก (chunks)
+2. **สร้าง Embeddings** → แปลงข้อความเป็นตัวเลขที่ AI เข้าใจ
+3. **ค้นหาอัจฉริยะ** → หาข้อมูลที่เกี่ยวข้องด้วย Semantic Search
+4. **ตอบคำถาม** → ใช้ข้อมูลที่ค้นหาได้มาสร้างคำตอบ
 
-### 🎯 **ใช้งานประจำ: Optimization**
-- ใช้ MMR สำหรับคำถามกว้าง ๆ
-- ใช้ Cosine Similarity สำหรับคำถามเฉพาะ
-- ปรับ Min Similarity ตามความต้องการ
-- ใช้ Debug Mode เพื่อปรับปรุงคำถาม
-
-### 🔄 **ทุกเดือน: Review**
-1. ทบทวนการตั้งค่า Chunk Size
-2. วิเคราะห์ Chat History
-3. อัพเดตเอกสารเก่า
-4. Re-index หากจำเป็น
+### 💡 ข้อดีของ RAG:
+- ✅ **ตอบได้แม่นยำ** จากเอกสารจริง
+- ✅ **แสดงแหล่งอ้างอิง** โปร่งใส
+- ✅ **ไม่ Hallucination** ไม่แต่งเรื่อง
+- ✅ **ปรับปรุงได้ตลอด** เพิ่มเอกสารใหม่ได้เรื่อย ๆ
 
 ---
 
-## 📊 ตัวอย่างการใช้งานในสถานการณ์จริง
+## 📱 วิธีใช้แต่ละแท็บ
 
-### 🏢 **บริษัท: จัดการเอกสารนโยบาย**
-```
-Setup:
-- Chunk Size: 1200 (นโยบายมักมีหัวข้อชัดเจน)
-- Overlap: 250
-- Model: Typhoon2 8B (เนื้อหาภาษาไทย)
-- MMR: เปิด (หลายนโยบายคล้ายกัน)
+### 📁 Upload & OCR
+- **จุดประสงค์:** แปลงเอกสารเป็นข้อความ
+- **ไฟล์ที่รองรับ:** PDF, PNG, JPG, JPEG (สูงสุด 10MB)
+- **เทคนิค:** ใช้ "Structure mode" สำหรับเอกสารที่มีตาราง
 
-Sample Questions:
-- "นโยบายการลาของพนักงานเป็นอย่างไร"
-- "เปรียบเทียบสิทธิประโยชน์ระหว่างตำแหน่งต่าง ๆ"
-- "ขั้นตอนการขอเลื่อนตำแหน่งมีอะไรบ้าง"
-```
+### 🧠 Knowledge Base  
+- **จุดประสงค์:** จัดการฐานข้อมูลความรู้
+- **ฟีเจอร์หลัก:**
+  - ดูสถิติเอกสารทั้งหมด
+  - เพิ่มเอกสารใหม่
+  - ดูตัวอย่างเนื้อหา
+  - ลบเอกสารที่ไม่ต้องการ
 
-### 🎓 **มหาวิทยาลัย: ระบบ Q&A เอกสารวิชาการ**
-```
-Setup:
-- Chunk Size: 1500 (เอกสารวิชาการมีเนื้อหาซับซ้อน)
-- Overlap: 300  
-- Model: Qwen2.5 14B (วิเคราะห์เชิงลึก)
-- MMR: เปิด (เปรียบเทียบทฤษฎี)
-
-Sample Questions:
-- "อธิบายทฤษฎี X จากบทที่ 3"  
-- "เปรียบเทียบแนวคิดของนักวิชาการ A และ B"
-- "ยกตัวอย่างการประยุกต์ใช้หลักการ Y"
-```
-
-### ⚖️ **สำนักงานกฎหมาย: ค้นหาข้อกฎหมาย**
-```
-Setup:  
-- Chunk Size: 1000 (ข้อกฎหมายมีโครงสร้างชัดเจน)
-- Overlap: 200
-- Model: Qwen2.5 14B (วิเคราะห์เชิงลึก)  
-- MMR: ปิด (ต้องการข้อมูลที่แม่นยำ)
-- Min Similarity: 0.4 (เข้มงวด)
-
-Sample Questions:
-- "มาตรา 25 ของพระราชบัญญัติ ABC กำหนดอย่างไร"
-- "โทษสำหรับการกระทำ X มีอะไรบ้าง"  
-- "ขั้นตอนการดำเนินคดีในกรณี Y"
-```
-
-### 🔬 **นักวิจัย: วิเคราะห์เอกสารงานวิจัย**
-```
-Setup:
-- Chunk Size: 1800 (บทความวิจัยมีเนื้อหาเยอะ)
-- Overlap: 400
-- Model: Qwen2.5 14B (วิเคราะห์สลับซับซ้อน)
-- MMR: เปิด (เปรียบเทียบงานวิจัย)
-
-Sample Questions:
-- "สรุป methodology ของงานวิจัยทั้งหมด"
-- "ข้อจำกัดของการศึกษาเหล่านี้คืออะไร"
-- "ผลการวิจัยสอดคล้องกันหรือไม่"
-```
+### 💬 AI Chat
+- **จุดประสงค์:** ถามตอบเกี่ยวกับเอกสาร
+- **ฟีเจอร์พิเศษ:**
+  - แสดงแหล่งอ้างอิง
+  - คะแนน Similarity
+  - บันทึก Chat History
+  - ล้างการสนทนาได้
 
 ---
 
-## ❓ Enhanced FAQ
+## ⚡ เคล็ดลับการใช้งาน
 
-### 🛠️ **Technical Questions**
+### 🎯 เพิ่มประสิทธิภาพ OCR:
+1. **สแกนด้วยความละเอียดสูง** (300 DPI ขึ้นไป)
+2. **ตรวจสอบแสงให้เหมาะสม** หลีกเลี่ยงเงา
+3. **เอกสารตรง** ไม่เอียง
+4. **ใช้ "Structure mode"** สำหรับตารางซับซ้อน
 
-**Q: ทำไมต้อง Re-index หลังเปลี่ยน Chunk Size?**  
-A: เพราะ embedding vector จะไม่ตรงกับเนื้อหา chunk ใหม่ ทำให้การค้นหาไม่แม่นยำ
+### 🧠 เพิ่มประสิทธิภาพ Knowledge Base:
+1. **แบ่งเอกสารใหญ่** เป็นหัวข้อย่อย ๆ
+2. **ใช้ชื่อไฟล์ที่มีความหมาย** เช่น "รายงานการเงิน_Q1_2024.md"
+3. **เพิ่มข้อมูลที่เกี่ยวข้องกัน** เพื่อให้ AI เข้าใจบริบท
+4. **ทำความสะอาดข้อมูล** เป็นระยะ ลบเอกสารที่ไม่จำเป็น
 
-**Q: MMR ต่างจาก Cosine Similarity อย่างไร?**  
-A: MMR พิจารณาทั้งความเกี่ยวข้อง และความหลากหลาย ในขณะที่ Cosine มองแค่ความเกี่ยวข้อง
+### 💬 เทคนิคการถามคำถาม:
+1. **ใช้คำถามที่ชัดเจน** เช่น "มียอดขายในเดือนมกราคมเท่าไหร่?"
+2. **อ้างอิงชื่อเอกสาร** เช่น "จากรายงานการเงิน มีกำไรเท่าไหร่?"
+3. **ใช้ภาษาไทยหรืออังกฤษ** ตามความเหมาะสม
+4. **ขอให้เปรียบเทียบ** เช่น "เปรียบเทียบผลงานไตรมาส 1 กับ 2"
 
-**Q: Min Similarity 0.3 หมายความว่าอย่างไร?**  
-A: เอกสารที่มีคะแนนความคล้ายน้อยกว่า 30% จะถูกปฏิเสธ ไม่นำมาตอบคำถาม
-
-### 🎯 **Usage Questions**
-
-**Q: ควรใช้โมเดลไหนสำหรับเอกสารภาษาไทย?**  
-A: Typhoon2 8B เหมาะสำหรับภาษาไทยโดยเฉพาะ แต่ Qwen2.5 14B ดีกว่าสำหรับการวิเคราะห์ซับซ้อน
-
-**Q: เมื่อไหร่ควรเปิด/ปิด MMR?**  
-A: เปิดเมื่อมีเอกสารหลายชิ้นที่คล้ายกัน ปิดเมื่อต้องการข้อมูลที่แม่นยำเฉพาะเจาะจง
-
-**Q: ทำไมระบบบอกว่า "ไม่พบข้อมูลที่เกี่ยวข้อง"?**  
-A: เพราะไม่มีเอกสารใดผ่าน Min Similarity threshold ลองลดค่าหรือปรับคำถาม
-
-### 🔧 **Troubleshooting**
-
-**Q: จะรู้ได้อย่างไรว่าการตั้งค่าเหมาะสม?**  
-A: ใช้ Debug Mode ดูคะแนน Similarity และปรับจนได้ผลลัพธ์ที่ต้องการ
-
-**Q: เอกสารหายหลัง Reset ได้คืนมาไหม?**  
-A: ไม่ได้ เพราะฉะนั้นควร Export ก่อน Reset เสมอ
-
-**Q: ระบบช้าเมื่อมีเอกสารเยอะ?**  
-A: ปกติ เพราะต้องค้นหาใน embedding space ที่ใหญ่ขึ้น ลองลด top_k ในการค้นหา
+### 🔧 แก้ปัญหาเบื้องต้น:
+- **OCR ไม่แม่นยำ** → เพิ่ม Image Quality, ใช้ Structure mode
+- **ไม่พบข้อมูล** → ตรวจสอบว่าเพิ่มเอกสารเข้า Knowledge Base แล้ว
+- **ตอบไม่ตรงคำถาม** → ทำให้คำถามชัดเจนขึ้น, เปลี่ยนโมเดล
 
 ---
 
-## 🎉 สรุป: Best Practices
+## 🚀 การใช้งานขั้นสูง
 
-### ✅ **ควรทำ**:
-1. **ใช้ Markdown format** เมื่อเพิ่มเอกสาร
-2. **Export backup** ก่อนทำการเปลี่ยนแปลงใหญ่
-3. **ทดสอบคำถาม** หลังเพิ่มเอกสารใหม่
-4. **ใช้ Debug Mode** เพื่อปรับปรุงผลลัพธ์
-5. **ปรับการตั้งค่า** ตามประเภทเอกสาร
+### 📊 Batch Processing:
+- เปิด "Enable Batch Processing" ในแท็บแรก
+- อัพโหลดหลายไฟล์พร้อมกัน
+- ใช้ปุ่ม "🧠 Add All to Knowledge Base" หลังประมวลผลเสร็จ
 
-### ❌ **ไม่ควรทำ**:
-1. **Reset โดยไม่ Export** ข้อมูลก่อน
-2. **ใช้คำถามที่กว้างเกินไป** โดยไม่ระบุบริบท
-3. **เพิ่มเอกสารที่ไม่เกี่ยวข้อง** เพราะจะรบกวนผลการค้นหา
-4. **เปลี่ยน Chunk Size** บ่อยเกินไปโดยไม่ Re-index
-5. **ตั้ง Min Similarity สูงเกินไป** จนไม่มีผลลัพธ์
+### 🔄 Workflow แนะนำ:
+1. **วันแรก:** อัพโหลดเอกสารสำคัญทั้งหมด
+2. **ทุกสัปดาห์:** เพิ่มเอกสารใหม่
+3. **ใช้ประจำ:** ถามตอบเพื่อค้นหาข้อมูล
+4. **ทุกเดือน:** ทำความสะอาด Knowledge Base
 
-### 🏆 **เป้าหมายสูงสุด**:
-สร้างระบบ RAG ที่**แม่นยำ**, **ครอบคลุม**, และ**ใช้งานง่าย**  
-เพื่อให้คุณค้นหาข้อมูลได้รวดเร็วและเชื่อถือได้ 100%
+### 🎛️ การปรับแต่งโมเดล:
+- **งาน OCR** → Typhoon OCR 7B
+- **ถามตอบภาษาไทย** → Typhoon2 8B  
+- **วิเคราะห์ซับซ้อน** → Qwen2.5 14B
+
+---
+
+## ❓ FAQ
+
+**Q: ฐานข้อมูลจะหายไหมถ้าปิดเบราว์เซอร์?**
+A: ไม่หาย ระบบใช้ SQLite เก็บข้อมูลแบบถาวร
+
+**Q: สามารถใช้งานออฟไลน์ได้ไหม?**
+A: ไม่ได้ ต้องเชื่อมต่ออินเทอร์เน็ตเพื่อใช้งาน AI
+
+**Q: รองรับภาษาไทยแค่ไหน?**
+A: รองรับเต็มรูปแบบทั้ง OCR และ Q&A
+
+**Q: จำกัดขนาดไฟล์เท่าไหร่?**
+A: ไฟล์เดี่ยว 10MB, ไม่จำกัดจำนวนไฟล์
+
+**Q: ลบข้อมูลใน Knowledge Base ได้ไหม?**
+A: ได้ ไปที่แท็บ Knowledge Base แล้วใช้ปุ่มลบในแต่ละเอกสาร
         """)
 
 # Run the app
