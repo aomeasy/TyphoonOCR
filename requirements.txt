@@ -10,7 +10,6 @@ numpy>=1.24.0
 pandas>=2.0.0
 urllib3>=2.0.0
 certifi>=2023.7.22
-tempfile
 os-sys
 pathlib2>=2.3.7
 jsonschema>=4.17.0
