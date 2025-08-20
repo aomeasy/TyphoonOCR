@@ -1,0 +1,6 @@
+# System packages required for PDF processing
+poppler-utils
+
+# Additional system dependencies (if needed)
+# libgl1-mesa-glx
+# libglib2.0-0
