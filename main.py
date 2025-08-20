@@ -105,11 +105,10 @@ def main():
     <div class="main-header">
         <h1>🌪️ Typhoon OCR</h1>
         <p>AI-Powered Thai-English Document Parser</p>
-        <p>Powered by SCB 10X With OneAI_NTNorth</p>
+        <p>Powered by SCB 10X Advanced AI Models</p>
     </div>
     """, unsafe_allow_html=True)
     
-      
     # Sidebar
     with st.sidebar:
         st.header("⚙️ Settings")
@@ -151,101 +150,88 @@ def main():
             image_quality = st.selectbox("Image Quality", ["high", "medium", "low"])
             batch_processing = st.checkbox("Enable Batch Processing")
     
-      # Main content area with Tabs
-    tab1, tab2, tab3 = st.tabs(["📁 Upload & Process", "✨ Features", "📖 คู่มือการใช้งาน"])
-
-    with tab1:
+    # Main content area
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
         st.header("📁 Upload Document")
-        # >>> เอาโค้ดเดิมใน col1 (upload file + process button) มาไว้ตรงนี้ <<<
-
-    with tab2:
+        
+        # File upload
+        uploaded_files = st.file_uploader(
+            "Choose files",
+            type=['pdf', 'png', 'jpg', 'jpeg'],
+            accept_multiple_files=batch_processing,
+            help="Support: PDF, PNG, JPG, JPEG (Max: 10MB per file)"
+        )
+        
+        # Preview uploaded files
+        if uploaded_files:
+            if isinstance(uploaded_files, list):
+                st.success(f"✅ {len(uploaded_files)} files uploaded")
+                for i, file in enumerate(uploaded_files[:3]):  # Show first 3
+                    st.write(f"{i+1}. {file.name} ({file.size} bytes)")
+                if len(uploaded_files) > 3:
+                    st.write(f"... and {len(uploaded_files) - 3} more files")
+            else:
+                st.success(f"✅ File uploaded: {uploaded_files.name}")
+                
+                # Show preview for single file
+                if uploaded_files.type.startswith('image'):
+                    image = Image.open(uploaded_files)
+                    st.image(image, caption="Uploaded Image", use_column_width=True)
+                elif uploaded_files.type == 'application/pdf':
+                    st.info("📄 PDF file uploaded - preview will be shown during processing")
+        
+        # Process button
+        if st.button("🚀 Process Document(s)", type="primary"):
+            if uploaded_files:
+                process_documents(uploaded_files, selected_model, {
+                    'temperature': temperature,
+                    'top_p': top_p,
+                    'max_tokens': max_tokens,
+                    'repetition_penalty': repetition_penalty,
+                    'prompt_type': prompt_type,
+                    'output_format': output_format,
+                    'image_quality': image_quality
+                })
+            else:
+                st.error("❌ Please upload at least one file!")
+    
+    with col2:
         st.header("✨ Features")
-        # >>> เอาโค้ดเดิมใน col2 (feature cards) มาไว้ตรงนี้ <<<
-
-    with tab3:
-        st.header("📖 คู่มือการใช้งาน Typhoon OCR")
-        st.markdown(""" 
-        🌟 **ภาพรวมระบบ**  
-        Typhoon OCR เป็นเครื่องมือแปลงเอกสารภาษาไทย-อังกฤษด้วย AI ที่สามารถ:
-        - อ่านและแปลงเอกสาร PDF และรูปภาพ  
-        - รองรับเอกสารที่มีโครงสร้างซับซ้อน  
-        - ประมวลผลหลายไฟล์พร้อมกัน  
-        - ส่งออกผลลัพธ์ในหลากหลายรูปแบบ  
-
-        ---
-
-        ### 🎯 การตั้งค่าตัวแปรการประมวลผล (Processing Parameters)
-
-        #### 🌡️ Temperature (อุณหภูมิ)
-        - 0.0–0.1 🎯 แม่นยำสูงสุด (OCR แนะนำ)  
-        - 0.2–0.5 ⚖️ สมดุล  
-        - 0.6–1.0 🌟 สร้างสรรค์ (ไม่แนะนำสำหรับ OCR)  
-
-        ตัวอย่าง:  
-        📄 ใบเสร็จ/บิล → 0.1  
-        📊 รายงานการเงิน → 0.1  
-        📚 หนังสือ/บทความ → 0.2–0.3  
-        🎨 เอกสารสร้างสรรค์ → 0.5–0.7  
-
-        #### 🎯 Top P (การเลือกคำ)
-        - 0.1–0.3 📊 เข้มงวด  
-        - 0.6 🎯 ค่าแนะนำ  
-        - 0.8–1.0 🎲 หลากหลาย  
-
-        #### 📝 Max Tokens (จำนวนคำสูงสุด)
-        - 1,000–3,000 → เอกสารสั้น  
-        - 4,000–8,000 → เอกสารกลาง  
-        - 9,000–16,384 → เอกสารยาว  
-
-        ---
-
-        ### 📄 OCR Settings
-        - 🔹 Default → เอกสารธรรมดา (ผลลัพธ์ Markdown)  
-        - 🔸 Structure → เอกสารซับซ้อน (ผลลัพธ์ HTML + Markdown พร้อม `<figure>`)  
-
-        **Output Format:**  
-        - 📝 Markdown → อ่านง่าย, ใช้งานทั่วไป  
-        - 🌐 HTML → รักษาโครงสร้างตาราง, เหมาะกับเว็บ  
-        - 📊 JSON → สำหรับนักพัฒนา/ประมวลผลต่อ  
-
-        ---
-
-        ### 🔧 Advanced Settings
-        - Repetition Penalty: 1.1–1.2 (แนะนำ)  
-        - Image Quality: High (300 DPI), Medium (200 DPI), Low (150 DPI)  
-
-        ---
-
-        ### 📊 ตัวชี้วัดประสิทธิภาพ
-        - ⏱️ 1 หน้า: 1–3 วินาที  
-        - 🎯 ความแม่นยำ: OCR บิล ~95–98%  
-        - 💰 ต้นทุน: Typhoon OCR ~฿0.05/หน้า  
-
-        ---
-
-        ### ✅ เคล็ดลับการใช้งาน
-        - เอกสารธรรมดา → Default + Markdown  
-        - เอกสารซับซ้อน → Structure + HTML  
-        - งานสำคัญ → High quality + Temp 0.1  
-
-        ---
-
-        ### ❓ การแก้ปัญหา
-        - ผลลัพธ์ไม่แม่นยำ → ลด Temp  
-        - อ่านตัวเล็กไม่ได้ → ใช้ High quality  
-        - ตารางเพี้ยน → ใช้ Structure + HTML  
-        - ช้า → ลด DPI หรือแยกไฟล์  
-        - ข้อความซ้ำ → เพิ่ม Repetition Penalty  
-
-        ---
-
-        ### 📞 การติดต่อ
-        - ตรวจสอบคู่มือนี้  
-        - ปรับค่าตามคำแนะนำ  
-        - ทดสอบกับเอกสารง่าย ๆ  
-        - ติดต่อทีม **AI NT North**  
-        """)
-
+        
+        # Feature cards
+        features = [
+            {
+                "icon": "📊",
+                "title": "Structured Documents",
+                "description": "รายงานทางการเงิน, เอกสารวิชาการ, แบบฟอร์มราชการ",
+                "items": ["Financial reports", "Academic papers", "Government forms", "Books & textbooks"]
+            },
+            {
+                "icon": "🍽️", 
+                "title": "Layout-Heavy Documents",
+                "description": "เอกสารที่เน้น Layout และไม่เป็นทางการ",
+                "items": ["Receipts & bills", "Food menus", "Tickets", "Infographics"]
+            },
+            {
+                "icon": "🔍",
+                "title": "Advanced Analysis", 
+                "description": "การวิเคราะห์รูปภาพและไดอะแกรมแบบลึกซึ้ง",
+                "items": ["Element detection", "Context analysis", "Text recognition", "Structure analysis"]
+            }
+        ]
+        
+        for feature in features:
+            st.markdown(f"""
+            <div class="feature-card">
+                <h3>{feature['icon']} {feature['title']}</h3>
+                <p>{feature['description']}</p>
+                <ul>
+                    {' '.join([f'<li>✓ {item}</li>' for item in feature['items']])}
+                </ul>
+            </div>
+            """, unsafe_allow_html=True)
 
 def convert_pdf_to_images(pdf_file, quality="high") -> list:
     """Convert PDF to images"""
@@ -504,3 +490,5 @@ def process_documents(uploaded_files, model: str, params: dict):
 # Run the app
 if __name__ == "__main__":
     main()
+
+ 
