@@ -1,8 +1,27 @@
+# Core Streamlit และ web framework
 streamlit>=1.28.0
 requests>=2.31.0
+
+# Image processing
 Pillow>=10.0.0
-PyPDF2>=3.0.0
-pdf2image>=1.16.0
-python-dotenv>=1.0.0
-pandas>=2.0.0
-numpy>=1.24.0
+pdf2image>=3.1.0
+
+# PDF processing (Alternative to pdf2image)
+PyPDF2>=3.0.1
+pymupdf>=1.23.0  # fitz - ทางเลือกที่ดีกว่าสำหรับ PDF
+
+# Base64 encoding (built-in Python)
+# json (built-in Python)
+# io (built-in Python)
+# tempfile (built-in Python)
+# os (built-in Python)
+# typing (built-in Python)
+
+# Optional: สำหรับการประมวลผล PDF ที่ดีกว่า
+pdfplumber>=0.9.0  # สำหรับ extract text จาก PDF
+python-multipart>=0.0.6  # สำหรับ file upload
+
+# System dependencies (ต้องติดตั้งแยก):
+# - poppler-utils (Linux/WSL): apt install poppler-utils
+# - poppler (macOS): brew install poppler  
+# - poppler (Windows): ดาวน์โหลดจาก https://github.com/oschwartz10612/poppler-windows
