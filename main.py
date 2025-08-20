@@ -105,7 +105,7 @@ def main():
     <div class="main-header">
         <h1>🌪️ Typhoon OCR</h1>
         <p>AI-Powered Thai-English Document Parser</p>
-        <p>Powered by SCB 10X with NT AI North Team</p>
+        <p>Powered by SCB 10X with AI NT North Team</p>
     </div>
     """, unsafe_allow_html=True)
 
