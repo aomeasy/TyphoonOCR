@@ -1,9 +1,41 @@
-
+# Core Streamlit and Web Framework
 streamlit>=1.28.0
 requests>=2.31.0
+
+# Image Processing and Computer Vision
 Pillow>=10.0.0
-PyPDF2>=3.0.0
-pdf2image>=1.16.0
-python-dotenv>=1.0.0
-pandas>=2.0.0
+pdf2image>=1.16.3
+
+# PDF Processing - Multiple Options for Better Compatibility
+PyPDF2>=3.0.1
+PyMuPDF>=1.23.0
+
+# Optional: Additional PDF processing tools
+# pdfplumber>=0.9.0
+# pypdfium2>=4.20.0
+
+# Data Processing
 numpy>=1.24.0
+pandas>=2.0.0
+
+# HTTP and API clients
+urllib3>=2.0.0
+certifi>=2023.7.22
+
+# System and File Handling
+tempfile
+os-sys
+pathlib2>=2.3.7
+
+# JSON and Data Serialization  
+jsonschema>=4.17.0
+
+# Error Handling and Logging
+traceback2>=1.4.0
+
+# Optional: For enhanced error reporting
+# sentry-sdk>=1.32.0
+
+# Development and Testing (comment out for production)
+# pytest>=7.4.0
+# black>=23.7.0
