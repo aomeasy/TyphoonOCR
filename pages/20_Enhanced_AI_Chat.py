@@ -8,7 +8,7 @@ st.set_page_config(page_title="Enhanced AI Chat", page_icon="💬", layout="wide
 # ใช้ DB path เดียวกับระบบเดิม (ถ้าไม่มีใน session จะ fallback)
 db_path = st.session_state.get("rag_db_path", "typhoon_rag_knowledge.db")
 
-st.sidebar.success("หน้านี้เป็น Add-on | ไม่กระทบโค้ดหลัก")
+st.sidebar.success("Add-on")
 st.sidebar.write("• เลือก Embedding/Top‑K/MMR\n• Extractive/Strict\n• อ้างอิงแหล่งข้อมูลอัตโนมัติ")
 
 ui_enhanced_ai_chat(
