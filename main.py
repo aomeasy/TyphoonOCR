@@ -936,25 +936,19 @@ def main():
                 "icon": "📊",
                 "title": "Structured Documents",
                 "description": "รายงานทางการเงิน, เอกสารวิชาการ, แบบฟอร์มราชการ",
-                "items": ["Financial reports with tables", "Academic papers with references", "Government forms and applications", "Books & textbooks with complex layouts"],
-                "accuracy": "92-96%",
-                "best_settings": "Structure prompt + HTML output"
+                "items": ["Financial reports", "Academic papers", "Government forms", "Books & textbooks"]
             },
             {
                 "icon": "🍽️", 
                 "title": "Layout-Heavy Documents",
                 "description": "เอกสารที่เน้น Layout และไม่เป็นทางการ",
-                "items": ["Receipts & bills with mixed layouts", "Food menus with images", "Tickets and vouchers", "Infographics and brochures"],
-                "accuracy": "85-92%",
-                "best_settings": "Structure prompt + High quality"
+                "items": ["Receipts & bills", "Food menus", "Tickets", "Infographics"]
             },
             {
                 "icon": "🔍",
                 "title": "Advanced Analysis", 
                 "description": "การวิเคราะห์รูปภาพและไดอะแกรมแบบลึกซึ้ง",
-                "items": ["Element detection and positioning", "Context-aware text extraction", "Multi-language text recognition", "Table structure preservation"],
-                "accuracy": "88-94%",
-                "best_settings": "Typhoon OCR model + Low temperature"
+                "items": ["Element detection", "Context analysis", "Text recognition", "Structure analysis"]
             }
         ]
         
