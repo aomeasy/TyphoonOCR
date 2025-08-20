@@ -9,8 +9,16 @@ import tempfile
 import os
 import sys
 import subprocess
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 import traceback
+import hashlib
+import pickle
+import sqlite3
+from datetime import datetime
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+import markdown
+import re
 
 # Try importing pdf2image with error handling
 try:
@@ -22,7 +30,7 @@ except ImportError:
 
 # Page configuration
 st.set_page_config(
-    page_title="🌪️ Typhoon OCR",
+    page_title="🌪️ Typhoon OCR with RAG",
     page_icon="🌪️",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -81,6 +89,30 @@ st.markdown("""
         border: 1px solid #ffeaa7;
     }
     
+    .chat-message {
+        padding: 1rem;
+        border-radius: 10px;
+        margin: 0.5rem 0;
+    }
+    
+    .user-message {
+        background: #e3f2fd;
+        border-left: 4px solid #2196f3;
+    }
+    
+    .assistant-message {
+        background: #f3e5f5;
+        border-left: 4px solid #9c27b0;
+    }
+    
+    .knowledge-card {
+        background: #e8f5e8;
+        padding: 1rem;
+        border-radius: 8px;
+        border-left: 4px solid #4caf50;
+        margin: 0.5rem 0;
+    }
+    
     .stButton > button {
         background: linear-gradient(45deg, #667eea, #764ba2) !important;
         color: white !important;
@@ -95,6 +127,14 @@ st.markdown("""
 EMBEDDING_API_URL = "http://209.15.123.47:11434/api/embeddings"
 EMBEDDING_MODEL = "nomic-embed-text:latest"
 OLLAMA_API_URL = "http://209.15.123.47:11434/api/generate"
+
+# Initialize session state for RAG
+if "knowledge_base" not in st.session_state:
+    st.session_state.knowledge_base = []
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "rag_db_path" not in st.session_state:
+    st.session_state.rag_db_path = "typhoon_rag_knowledge.db"
 
 AVAILABLE_MODELS = {
     "scb10x/typhoon-ocr-7b:latest": {
@@ -116,6 +156,260 @@ AVAILABLE_MODELS = {
         "best_for": "Thai language, Instructions following"
     }
 }
+
+# ==================== RAG SYSTEM FUNCTIONS ====================
+
+class RAGKnowledgeBase:
+    def __init__(self, db_path: str = "typhoon_rag_knowledge.db"):
+        self.db_path = db_path
+        self.init_database()
+    
+    def init_database(self):
+        """Initialize SQLite database for knowledge storage"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename TEXT NOT NULL,
+                content TEXT NOT NULL,
+                embedding BLOB,
+                chunk_id INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                file_hash TEXT,
+                metadata TEXT
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                question TEXT,
+                answer TEXT,
+                context TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    def get_embedding(self, text: str) -> Optional[List[float]]:
+        """Get embedding from Ollama API"""
+        try:
+            response = requests.post(
+                EMBEDDING_API_URL,
+                json={
+                    "model": EMBEDDING_MODEL,
+                    "prompt": text
+                },
+                timeout=60
+            )
+            response.raise_for_status()
+            result = response.json()
+            return result.get('embedding', [])
+        except Exception as e:
+            st.error(f"❌ Error getting embedding: {str(e)}")
+            return None
+    
+    def chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
+        """Split text into overlapping chunks"""
+        if len(text) <= chunk_size:
+            return [text]
+        
+        chunks = []
+        start = 0
+        
+        while start < len(text):
+            end = start + chunk_size
+            
+            # Try to break at sentence boundaries
+            if end < len(text):
+                # Look for sentence endings
+                sentence_ends = ['. ', '! ', '? ', '\n\n', '。', '！', '？']
+                best_break = end
+                
+                for i in range(min(100, len(text) - end)):
+                    for ending in sentence_ends:
+                        if text[end + i:end + i + len(ending)] == ending:
+                            best_break = end + i + len(ending)
+                            break
+                    if best_break != end:
+                        break
+                
+                end = best_break
+            
+            chunk = text[start:end].strip()
+            if chunk:
+                chunks.append(chunk)
+            
+            start = end - overlap
+            if start >= len(text):
+                break
+                
+        return chunks
+    
+    def add_document(self, filename: str, content: str, metadata: Dict = None) -> bool:
+        """Add document to knowledge base"""
+        try:
+            # Create file hash for deduplication
+            file_hash = hashlib.md5(content.encode()).hexdigest()
+            
+            # Check if document already exists
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM documents WHERE file_hash = ?", (file_hash,))
+            if cursor.fetchone():
+                conn.close()
+                st.warning(f"⚠️ Document {filename} already exists in knowledge base")
+                return False
+            
+            # Process markdown content
+            if filename.endswith('.md'):
+                # Convert markdown to plain text for better chunking
+                html = markdown.markdown(content)
+                # Remove HTML tags
+                plain_text = re.sub('<[^<]+?>', '', html)
+                content = plain_text
+            
+            # Chunk the content
+            chunks = self.chunk_text(content)
+            
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            for i, chunk in enumerate(chunks):
+                status_text.text(f"Processing chunk {i+1}/{len(chunks)}...")
+                progress_bar.progress((i + 1) / len(chunks))
+                
+                # Get embedding
+                embedding = self.get_embedding(chunk)
+                if embedding:
+                    # Store in database
+                    cursor.execute('''
+                        INSERT INTO documents 
+                        (filename, content, embedding, chunk_id, file_hash, metadata)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    ''', (
+                        filename, 
+                        chunk, 
+                        pickle.dumps(embedding), 
+                        i,
+                        file_hash,
+                        json.dumps(metadata or {})
+                    ))
+            
+            conn.commit()
+            conn.close()
+            
+            status_text.text(f"✅ Added {len(chunks)} chunks from {filename}")
+            progress_bar.progress(1.0)
+            return True
+            
+        except Exception as e:
+            st.error(f"❌ Error adding document: {str(e)}")
+            return False
+    
+    def search_similar(self, query: str, top_k: int = 5) -> List[Tuple[str, str, float]]:
+        """Search for similar content"""
+        try:
+            query_embedding = self.get_embedding(query)
+            if not query_embedding:
+                return []
+            
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT filename, content, embedding FROM documents")
+            
+            results = []
+            for filename, content, embedding_blob in cursor.fetchall():
+                stored_embedding = pickle.loads(embedding_blob)
+                similarity = cosine_similarity(
+                    [query_embedding], 
+                    [stored_embedding]
+                )[0][0]
+                results.append((filename, content, similarity))
+            
+            conn.close()
+            
+            # Sort by similarity and return top_k
+            results.sort(key=lambda x: x[2], reverse=True)
+            return results[:top_k]
+            
+        except Exception as e:
+            st.error(f"❌ Error searching: {str(e)}")
+            return []
+    
+    def get_stats(self) -> Dict:
+        """Get knowledge base statistics"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT COUNT(DISTINCT filename) FROM documents")
+            total_docs = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM documents")
+            total_chunks = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM chat_sessions")
+            total_chats = cursor.fetchone()[0]
+            
+            conn.close()
+            
+            return {
+                "total_documents": total_docs,
+                "total_chunks": total_chunks,
+                "total_chat_sessions": total_chats
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+def generate_rag_response(query: str, context_docs: List[Tuple[str, str, float]], model: str = "qwen2.5:14b") -> Optional[str]:
+    """Generate response using RAG context"""
+    try:
+        # Prepare context
+        context_text = "\n\n".join([
+            f"จากเอกสาร '{doc[0]}':\n{doc[1]}" 
+            for doc in context_docs[:3]  # Use top 3 most relevant
+        ])
+        
+        # Create prompt
+        prompt = f"""คุณเป็น AI Assistant ที่ช่วยตอบคำถามจากเอกสารที่ให้มา ใช้ข้อมูลจากบริบทต่อไปนี้ในการตอบคำถาม:
+
+บริบทจากเอกสาร:
+{context_text}
+
+คำถาม: {query}
+
+กรุณาตอบคำถามโดยอ้างอิงข้อมูลจากเอกสารที่ให้มา หากไม่มีข้อมูลที่เกี่ยวข้องในเอกสาร ให้บอกว่าไม่พบข้อมูลที่เกี่ยวข้อง
+
+คำตอบ:"""
+        
+        # Call API
+        response = requests.post(
+            OLLAMA_API_URL,
+            json={
+                "model": model,
+                "prompt": prompt,
+                "temperature": 0.3,
+                "top_p": 0.8,
+                "stream": False
+            },
+            timeout=120
+        )
+        response.raise_for_status()
+        
+        result = response.json()
+        return result.get('response', '')
+        
+    except Exception as e:
+        st.error(f"❌ Error generating RAG response: {str(e)}")
+        return None
+
+# ==================== ORIGINAL OCR FUNCTIONS ====================
 
 def check_system_dependencies():
     """Check if system dependencies are available"""
@@ -602,6 +896,28 @@ def process_documents(uploaded_files, model: str, params: dict):
                     with col4:
                         st.metric("📄 File Size", f"{result['file_size']/1024:.1f}KB")
                 
+                # RAG Integration - Auto-add to knowledge base option
+                if st.button(f"🧠 Add to Knowledge Base", key=f"add_kb_{i}"):
+                    # Combine all successful page content
+                    combined_content = "\n\n".join([
+                        page['content'] for page in result['pages'] if page['success']
+                    ])
+                    
+                    # Add to RAG knowledge base
+                    kb = RAGKnowledgeBase(st.session_state.rag_db_path)
+                    success = kb.add_document(
+                        filename=file.name,
+                        content=combined_content,
+                        metadata={
+                            "processing_time": s.get('total_processing_time', 0),
+                            "model_used": model,
+                            "successful_pages": s.get('successful_pages', 0)
+                        }
+                    )
+                    if success:
+                        st.success(f"✅ Added {file.name} to knowledge base!")
+                        st.rerun()
+                
                 # Show results for each page
                 for page in result['pages']:
                     if page['success']:
@@ -746,20 +1062,42 @@ def process_documents(uploaded_files, model: str, params: dict):
             'json': 'json'
         }.get(params.get('output_format', 'markdown'), 'md')
         
-        st.download_button(
-            "📦 Download All Results",
-            combined_content,
-            f"typhoon_ocr_results.{file_extension}",
-            f"text/{file_extension}",
-            help=f"Download combined results in {params.get('output_format', 'markdown')} format"
-        )
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            st.download_button(
+                "📦 Download All Results",
+                combined_content,
+                f"typhoon_ocr_results.{file_extension}",
+                f"text/{file_extension}",
+                help=f"Download combined results in {params.get('output_format', 'markdown')} format"
+            )
+        
+        with col2:
+            if st.button("🧠 Add All to Knowledge Base"):
+                kb = RAGKnowledgeBase(st.session_state.rag_db_path)
+                added_count = 0
+                for result in all_results:
+                    if result['success']:
+                        combined_content = "\n\n".join([
+                            page['content'] for page in result['pages'] if page['success']
+                        ])
+                        if kb.add_document(
+                            filename=result['filename'],
+                            content=combined_content,
+                            metadata={"batch_processed": True}
+                        ):
+                            added_count += 1
+                
+                if added_count > 0:
+                    st.success(f"✅ Added {added_count} documents to knowledge base!")
+                    st.rerun()
 
 def main():
     # Header
     st.markdown("""
     <div class="main-header">
-        <h1>🌪️ Typhoon OCR</h1>
-        <p>AI-Powered Thai-English Document Parser</p>
+        <h1>🌪️ Typhoon OCR with RAG</h1>
+        <p>AI-Powered Thai-English Document Parser + Knowledge Q&A</p>
         <p>Powered by SCB 10X with AI NT North Team</p>
     </div>
     """, unsafe_allow_html=True)
@@ -791,6 +1129,21 @@ def main():
             else:
                 st.warning("⚠️ Basic PDF support (PyPDF2 only)")
             
+        # RAG Knowledge Base Status
+        kb = RAGKnowledgeBase(st.session_state.rag_db_path)
+        stats = kb.get_stats()
+        
+        st.header("🧠 Knowledge Base")
+        if not stats.get("error"):
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("📚 Documents", stats["total_documents"])
+            with col2:
+                st.metric("📄 Chunks", stats["total_chunks"])
+            st.metric("💬 Chat Sessions", stats["total_chat_sessions"])
+        else:
+            st.error("❌ Knowledge base error")
+        
         # Model selection
         st.subheader("🤖 Model Selection")
         selected_model = st.selectbox(
@@ -846,11 +1199,17 @@ def main():
             st.info("📏 **File Limits:**\n- Max file size: 10MB\n- Supported: PDF, PNG, JPG, JPEG")
 
     # ===== Main content area with Tabs =====
-    tab1, tab2, tab3 = st.tabs(["📁 Upload & Process", "✨ Features", "📖 คู่มือการใช้งาน"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "📁 Upload & OCR", 
+        "🧠 Knowledge Base", 
+        "💬 AI Chat", 
+        "✨ Features", 
+        "📖 คู่มือการใช้งาน"
+    ])
 
-    # ---- Tab 1: Upload & Process ----
+    # ---- Tab 1: Upload & Process (Original OCR) ----
     with tab1:
-        st.header("📁 Upload Document")
+        st.header("📁 Upload Document for OCR")
 
         # File upload
         uploaded_files = st.file_uploader(
@@ -926,29 +1285,266 @@ def main():
             if st.button("🔄 Clear Files"):
                 st.rerun()
 
-    # ---- Tab 2: Features ----
+    # ---- Tab 2: Knowledge Base Management ----
     with tab2:
-        st.header("✨ Features")
+        st.header("🧠 Knowledge Base Management")
         
-        # Enhanced feature cards with more details
+        kb = RAGKnowledgeBase(st.session_state.rag_db_path)
+        stats = kb.get_stats()
+        
+        # Display stats
+        if not stats.get("error"):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("📚 Total Documents", stats["total_documents"])
+            with col2:
+                st.metric("📄 Total Chunks", stats["total_chunks"])
+            with col3:
+                st.metric("💬 Chat Sessions", stats["total_chat_sessions"])
+        
+        st.markdown("---")
+        
+        # Add documents manually
+        st.subheader("📤 Add Documents to Knowledge Base")
+        
+        # Method 1: Upload Markdown files
+        st.write("**Method 1: Upload Markdown Files**")
+        markdown_files = st.file_uploader(
+            "Upload Markdown files",
+            type=['md', 'txt'],
+            accept_multiple_files=True,
+            help="Upload .md or .txt files to add to knowledge base"
+        )
+        
+        if markdown_files and st.button("➕ Add Markdown Files"):
+            added_count = 0
+            for file in markdown_files:
+                try:
+                    content = file.read().decode('utf-8')
+                    if kb.add_document(
+                        filename=file.name,
+                        content=content,
+                        metadata={"source": "manual_upload", "file_type": "markdown"}
+                    ):
+                        added_count += 1
+                except Exception as e:
+                    st.error(f"❌ Error adding {file.name}: {str(e)}")
+            
+            if added_count > 0:
+                st.success(f"✅ Added {added_count} markdown files to knowledge base!")
+                st.rerun()
+        
+        # Method 2: Direct text input
+        st.write("**Method 2: Direct Text Input**")
+        with st.form("add_text_form"):
+            doc_title = st.text_input("Document Title", placeholder="Enter document title")
+            doc_content = st.text_area(
+                "Document Content",
+                height=200,
+                placeholder="Paste or type your document content here..."
+            )
+            
+            submitted = st.form_submit_button("➕ Add to Knowledge Base")
+            if submitted and doc_title and doc_content:
+                if kb.add_document(
+                    filename=f"{doc_title}.md",
+                    content=doc_content,
+                    metadata={"source": "manual_input"}
+                ):
+                    st.success(f"✅ Added '{doc_title}' to knowledge base!")
+                    st.rerun()
+        
+        st.markdown("---")
+        
+        # Knowledge base browser
+        st.subheader("📖 Browse Knowledge Base")
+        
+        if stats.get("total_documents", 0) > 0:
+            # Get document list
+            conn = sqlite3.connect(st.session_state.rag_db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT DISTINCT filename, COUNT(*) as chunk_count, MAX(created_at) as latest FROM documents GROUP BY filename ORDER BY latest DESC")
+            docs = cursor.fetchall()
+            conn.close()
+            
+            # Display documents
+            for filename, chunk_count, created_at in docs:
+                with st.expander(f"📄 {filename} ({chunk_count} chunks)"):
+                    st.write(f"**Created:** {created_at}")
+                    st.write(f"**Chunks:** {chunk_count}")
+                    
+                    # Show first chunk as preview
+                    conn = sqlite3.connect(st.session_state.rag_db_path)
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT content FROM documents WHERE filename = ? LIMIT 1", (filename,))
+                    preview = cursor.fetchone()
+                    if preview:
+                        st.write("**Preview:**")
+                        st.text(preview[0][:200] + "..." if len(preview[0]) > 200 else preview[0])
+                    conn.close()
+                    
+                    # Delete button
+                    if st.button(f"🗑️ Delete {filename}", key=f"del_{filename}"):
+                        conn = sqlite3.connect(st.session_state.rag_db_path)
+                        cursor = conn.cursor()
+                        cursor.execute("DELETE FROM documents WHERE filename = ?", (filename,))
+                        conn.commit()
+                        conn.close()
+                        st.success(f"✅ Deleted {filename}")
+                        st.rerun()
+        else:
+            st.info("📝 No documents in knowledge base yet. Add some documents to get started!")
+
+    # ---- Tab 3: AI Chat with RAG ----
+    with tab3:
+        st.header("💬 AI Chat with Knowledge Base")
+        
+        # Check if knowledge base has content
+        if stats.get("total_documents", 0) == 0:
+            st.warning("⚠️ No documents in knowledge base. Please add documents in the Knowledge Base tab first.")
+            return
+        
+        # Chat interface
+        st.subheader("🗣️ Ask Questions About Your Documents")
+        
+        # Display chat history
+        for i, (question, answer, context) in enumerate(st.session_state.chat_history):
+            # User message
+            st.markdown(f"""
+            <div class="chat-message user-message">
+                <strong>🤔 You:</strong><br>
+                {question}
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Assistant message
+            st.markdown(f"""
+            <div class="chat-message assistant-message">
+                <strong>🤖 Assistant:</strong><br>
+                {answer}
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Show context sources
+            if context:
+                with st.expander(f"📚 Sources (Chat {i+1})", expanded=False):
+                    for j, (filename, content, similarity) in enumerate(context):
+                        st.markdown(f"""
+                        <div class="knowledge-card">
+                            <strong>📄 {filename}</strong> (Similarity: {similarity:.3f})<br>
+                            <em>{content[:200]}...</em>
+                        </div>
+                        """, unsafe_allow_html=True)
+        
+        # Chat input
+        with st.form("chat_form", clear_on_submit=True):
+            user_question = st.text_input(
+                "Ask a question:",
+                placeholder="What would you like to know about your documents?",
+                key="chat_input"
+            )
+            
+            col1, col2, col3 = st.columns([1, 1, 4])
+            with col1:
+                ask_button = st.form_submit_button("🚀 Ask")
+            with col2:
+                clear_button = st.form_submit_button("🗑️ Clear Chat")
+            
+            if clear_button:
+                st.session_state.chat_history = []
+                st.rerun()
+        
+        if ask_button and user_question:
+            with st.spinner("🔍 Searching knowledge base and generating response..."):
+                # Search for relevant context
+                context_docs = kb.search_similar(user_question, top_k=5)
+                
+                if context_docs:
+                    # Generate RAG response
+                    response = generate_rag_response(
+                        user_question, 
+                        context_docs, 
+                        selected_model
+                    )
+                    
+                    if response:
+                        # Add to chat history
+                        st.session_state.chat_history.append((
+                            user_question,
+                            response,
+                            context_docs[:3]  # Store top 3 for context
+                        ))
+                        
+                        # Save to database
+                        conn = sqlite3.connect(st.session_state.rag_db_path)
+                        cursor = conn.cursor()
+                        cursor.execute('''
+                            INSERT INTO chat_sessions (session_id, question, answer, context)
+                            VALUES (?, ?, ?, ?)
+                        ''', (
+                            "default",  # Simple session management
+                            user_question,
+                            response,
+                            json.dumps([(doc[0], doc[1][:200], doc[2]) for doc in context_docs[:3]])
+                        ))
+                        conn.commit()
+                        conn.close()
+                        
+                        st.rerun()
+                    else:
+                        st.error("❌ Failed to generate response")
+                else:
+                    st.warning("⚠️ No relevant information found in knowledge base")
+
+    # ---- Tab 4: Features ----
+    with tab4:
+        st.header("✨ Enhanced Features with RAG")
+        
+        # Enhanced feature cards
         features = [
             {
+                "icon": "🌪️",
+                "title": "Advanced OCR Processing",
+                "description": "ประมวลผลเอกสารด้วย AI ที่ทันสมัย",
+                "items": [
+                    "Thai-English OCR with high accuracy",
+                    "Complex document structure recognition", 
+                    "Batch processing for multiple files",
+                    "Multiple output formats (MD, HTML, JSON)"
+                ]
+            },
+            {
+                "icon": "🧠", 
+                "title": "RAG Knowledge Base",
+                "description": "สร้างฐานความรู้และค้นหาข้อมูลอัจฉริยะ",
+                "items": [
+                    "Auto-import OCR results to knowledge base",
+                    "Manual markdown document upload",
+                    "Intelligent text chunking and embedding",
+                    "Semantic search with similarity scoring"
+                ]
+            },
+            {
+                "icon": "💬",
+                "title": "AI-Powered Q&A",
+                "description": "ถามตอบกับเอกสารด้วย AI",
+                "items": [
+                    "Context-aware responses from your documents",
+                    "Multi-language support (Thai-English)",
+                    "Source attribution and transparency",
+                    "Chat history and session management"
+                ]
+            },
+            {
                 "icon": "📊",
-                "title": "Structured Documents",
-                "description": "รายงานทางการเงิน, เอกสารวิชาการ, แบบฟอร์มราชการ",
-                "items": ["Financial reports", "Academic papers", "Government forms", "Books & textbooks"]
-            },
-            {
-                "icon": "🍽️", 
-                "title": "Layout-Heavy Documents",
-                "description": "เอกสารที่เน้น Layout และไม่เป็นทางการ",
-                "items": ["Receipts & bills", "Food menus", "Tickets", "Infographics"]
-            },
-            {
-                "icon": "🔍",
-                "title": "Advanced Analysis", 
-                "description": "การวิเคราะห์รูปภาพและไดอะแกรมแบบลึกซึ้ง",
-                "items": ["Element detection", "Context analysis", "Text recognition", "Structure analysis"]
+                "title": "Document Analytics", 
+                "description": "วิเคราะห์และจัดการเอกสารอย่างครอบคลุม",
+                "items": [
+                    "Processing performance metrics",
+                    "Knowledge base statistics",
+                    "Document similarity analysis",
+                    "Content organization and retrieval"
+                ]
             }
         ]
         
@@ -963,6 +1559,25 @@ def main():
             </div>
             """, unsafe_allow_html=True)
         
+        # Workflow diagram
+        st.subheader("🔄 Enhanced Workflow")
+        st.markdown("""
+        ```mermaid
+        graph TD
+            A[📄 Upload Document] --> B[🌪️ OCR Processing]
+            B --> C[📝 Extract Text/Markdown]
+            C --> D{Add to Knowledge Base?}
+            D -->|Yes| E[🧠 Store in RAG DB]
+            D -->|No| F[💾 Download Results]
+            E --> G[💬 AI Chat Ready]
+            G --> H[🔍 Ask Questions]
+            H --> I[🤖 Context-Aware Answers]
+            
+            J[📤 Manual Upload] --> E
+            K[✍️ Direct Input] --> E
+        ```
+        """)
+        
         # Performance comparison
         st.subheader("⚡ Model Performance Comparison")
         
@@ -971,130 +1586,218 @@ def main():
             "Thai OCR": ["⭐⭐⭐⭐⭐", "⭐⭐⭐", "⭐⭐⭐⭐"],
             "English OCR": ["⭐⭐⭐⭐⭐", "⭐⭐⭐⭐⭐", "⭐⭐⭐⭐"],
             "Complex Tables": ["⭐⭐⭐⭐⭐", "⭐⭐⭐⭐", "⭐⭐⭐"],
+            "Thai Q&A": ["⭐⭐⭐⭐", "⭐⭐⭐⭐", "⭐⭐⭐⭐⭐"],
             "Processing Speed": ["⭐⭐⭐⭐", "⭐⭐", "⭐⭐⭐⭐"],
-            "Best For": ["OCR Tasks", "General Analysis", "Thai Content"]
+            "Best For": ["OCR Tasks", "RAG Q&A", "Thai Content"]
         }
         
         st.table(performance_data)
+        
+        # RAG Benefits
+        st.subheader("🎯 RAG System Benefits")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("""
+            **📚 Knowledge Management:**
+            - Persistent document storage
+            - Intelligent text chunking
+            - Semantic search capabilities
+            - Multi-document correlation
+            
+            **🔍 Smart Retrieval:**
+            - Context-aware responses
+            - Source attribution
+            - Similarity scoring
+            - Multi-language support
+            """)
+        
+        with col2:
+            st.markdown("""
+            **⚡ Efficiency Gains:**
+            - Instant document lookup
+            - Automated knowledge base building
+            - Batch processing integration
+            - Scalable architecture
+            
+            **🎯 Use Cases:**
+            - Corporate document Q&A
+            - Research paper analysis
+            - Legal document review
+            - Technical documentation
+            """)
 
-    # ---- Tab 3: User Guide ---- (keeping the original comprehensive guide)
-    with tab3:
-        st.header("📖 คู่มือการใช้งาน Typhoon OCR")
+    # ---- Tab 5: User Guide ----
+    with tab5:
+        st.header("📖 คู่มือการใช้งาน Typhoon OCR with RAG")
+        
         st.markdown("""
-🌟 **ภาพรวมระบบ**  
-Typhoon OCR เป็นเครื่องมือแปลงเอกสารภาษาไทย-อังกฤษด้วย AI ที่สามารถ:
+## 🌟 ภาพรวมระบบที่ปรับปรุงแล้ว
 
-- อ่านและแปลงเอกสาร PDF และรูปภาพ  
-- รองรับเอกสารที่มีโครงสร้างซับซ้อน  
-- ประมวลผลหลายไฟล์พร้อมกัน  
-- ส่งออกผลลัพธ์ในหลากหลายรูปแบบ  
+Typhoon OCR with RAG เป็นระบบที่รวม **OCR ขั้นสูง** กับ **RAG (Retrieval-Augmented Generation)** เพื่อให้คุณสามารถ:
 
----
-
-### 🎯 การตั้งค่าตัวแปรการประมวลผล (Processing Parameters)
-
-#### 🌡️ Temperature (อุณหภูมิ)
-**คืออะไร:** ควบคุมความสร้างสรรค์และความแปรปรวนของ AI  
-
-**ค่าแนะนำ:**
-- **0.0-0.1 🎯 แม่นยำสูงสุด (แนะนำสำหรับ OCR)**
-  - ผลลัพธ์คาดเดาได้  
-  - เหมาะสำหรับเอกสารราชการ, รายงานทางการเงิน  
-  - ความผิดพลาดน้อยที่สุด  
-- **0.2-0.5 ⚖️ สมดุล**
-  - ผลลัพธ์หลากหลายแต่ยังคุมได้  
-  - เหมาะสำหรับเอกสารที่มีเนื้อหาซับซ้อน  
-  - สำหรับเอกสารที่ต้องการการตีความ
-- **0.6-1.0 🌟 สร้างสรรค์**
-  - ผลลัพธ์หลากหลายมาก  
-  - ไม่แนะนำสำหรับ OCR (อาจมีข้อผิดพลาด)  
-  - เหมาะสำหรับงานเขียนสร้างสรรค์
-
-**ตัวอย่างการใช้งาน:**
-- 📄 ใบเสร็จ/บิล → Temperature **0.1**  
-- 📊 รายงานการเงิน → Temperature **0.1**  
-- 📚 หนังสือ/บทความ → Temperature **0.2-0.3**  
-- 🎨 เอกสารสร้างสรรค์ → Temperature **0.5-0.7**
-
-#### 🎯 Top P (การเลือกคำ)
-**คืออะไร:** ควบคุมว่า AI จะพิจารณาคำที่มีความน่าจะเป็นสูงแค่ไหน  
-
-**ค่าแนะนำ:**
-- **0.1-0.3 📊 เข้มงวด**  
-  เลือกเฉพาะคำที่แน่นอนที่สุด เหมาะสำหรับข้อมูลที่ต้องการความแม่นยำสูง  
-- **0.6 🎯 ค่าแนะนำ (Default)**  
-  สมดุลระหว่างความแม่นยำและความหลากหลาย เหมาะสำหรับงาน OCR ทั่วไป  
-- **0.8-1.0 🎲 หลากหลาย**  
-  เปิดโอกาสให้คำที่หลากหลายมากขึ้น อาจให้ผลลัพธ์ที่ไม่สม่ำเสมอ
- 
----
-#### 📏 Max Tokens (จำนวนคำสูงสุด)
-**คืออะไร:** จำกัดจำนวนข้อความที่ AI สามารถสร้างออกมาได้  
-- ถ้าตั้งค่าน้อยเกินไป → เอกสารยาว ๆ จะถูกตัดออก ไม่ครบถ้วน  
-- ถ้าตั้งค่าสูงเกินไป → ใช้เวลาประมวลผลนานขึ้น  
-
-**คำแนะนำ:**  
-- เอกสารสั้น (ใบเสร็จ/บิล) → 1,000 – 3,000  
-- เอกสารกลาง (รายงาน 2–3 หน้า) → 4,000 – 8,000  
-- เอกสารยาว (หนังสือ/รายงานหลายสิบหน้า) → 9,000 – 16,000  
+1. **📄 ประมวลผลเอกสาร** - แปลง PDF/รูปภาพเป็นข้อความ
+2. **🧠 สร้างฐานความรู้** - เก็บข้อมูลอย่างเป็นระบบ
+3. **💬 ถามตอบอัจฉริยะ** - ค้นหาและตอบคำถามจากเอกสาร
 
 ---
 
-### 📄 OCR Settings
+## 🔄 ขั้นตอนการใช้งานแบบครบวงจร
 
-#### 🔹 Prompt Type (รูปแบบการตีความเอกสาร)
-- **Default (Simple)** → เอกสารทั่วไปที่ไม่มีตารางซับซ้อน  
-- **Structure (Complex Document)** → เอกสารที่มีตาราง, ฟอร์มราชการ, รายงานการเงิน  
+### ขั้นตอนที่ 1: OCR Processing
+1. **เปิดแท็บ "📁 Upload & OCR"**
+2. **อัพโหลดไฟล์** (PDF, PNG, JPG, JPEG)
+3. **ตั้งค่าพารามิเตอร์** ตามต้องการ
+4. **กดปุ่ม "🚀 Process Document(s)"**
+5. **รอผลลัพธ์** และตรวจสอบความแม่นยำ
 
-#### 🔹 Output Format (รูปแบบไฟล์ที่ได้)
-- **Markdown (.md)** → เบา, อ่านง่าย, เหมาะกับ Note หรือ GitHub  
-- **HTML (.html)** → เก็บเลย์เอาต์ซับซ้อนได้ดีที่สุด, เหมาะกับการเปิดในเว็บ  
-- **JSON (.json)** → ข้อมูลเชิงโครงสร้าง เหมาะกับนักพัฒนาและงาน Automation  
+### ขั้นตอนที่ 2: เพิ่มเข้า Knowledge Base
+หลังจาก OCR เสร็จแล้ว มี **3 วิธี** ในการเพิ่มข้อมูลเข้า Knowledge Base:
 
----
+#### 🔹 วิธีที่ 1: Auto-add จากผล OCR
+- หลังจาก OCR เสร็จ จะมีปุ่ม **"🧠 Add to Knowledge Base"**
+- กดปุ่มนี้เพื่อเพิ่มข้อมูลโดยอัตโนมัติ
 
-### ⚙️ Advanced Settings
+#### 🔹 วิธีที่ 2: Upload Markdown Files
+- ไปที่แท็บ **"🧠 Knowledge Base"**
+- ในส่วน **"Method 1: Upload Markdown Files"**
+- อัพโหลดไฟล์ .md หรือ .txt
+- กดปุ่ม **"➕ Add Markdown Files"**
 
-#### 🔄 Repetition Penalty (ป้องกันการซ้ำของคำ)
-- **1.0** = ไม่บังคับ (อาจซ้ำได้บ้าง)  
-- **1.1 – 1.3** ✅ ค่าแนะนำ (ลดคำซ้ำพอดี ๆ)  
-- **>1.5** = เข้มงวดมาก (แทบไม่ซ้ำ แต่บางทีอ่านไม่ลื่น)  
+#### 🔹 วิธีที่ 3: Direct Text Input
+- ในส่วน **"Method 2: Direct Text Input"**
+- ใส่ชื่อเอกสารและเนื้อหา
+- กดปุ่ม **"➕ Add to Knowledge Base"**
 
----
-
-### 🖼️ Image Quality (คุณภาพภาพต้นฉบับ)
-- **High (300 DPI)** → ชัดที่สุด เหมาะกับเอกสารราชการ/การเงิน  
-- **Medium (200 DPI)** → สมดุลที่สุด เหมาะกับการใช้งานทั่วไป  
-- **Low (150 DPI)** → เร็วที่สุด แต่ตัวหนังสือเล็ก ๆ อาจอ่านไม่ออก  
-
----
-
-### 📂 Batch Processing (ประมวลผลหลายไฟล์พร้อมกัน)
-**คืออะไร:** ประมวลผลเอกสารหลายไฟล์ในครั้งเดียว  
-- ✅ ประหยัดเวลา  
-- ✅ เหมาะกับงานที่ต้อง OCR จำนวนมาก  
-- ⚠️ ควรตรวจสอบผลลัพธ์เป็นบางไฟล์ เพราะอาจมีข้อผิดพลาดปนมา  
+### ขั้นตอนที่ 3: ถามตอบด้วย AI
+1. **ไปที่แท็บ "💬 AI Chat"**
+2. **พิมพ์คำถาม** ในช่อง "Ask a question"
+3. **กดปุ่ม "🚀 Ask"**
+4. **รอคำตอบ** พร้อมแหล่งอ้างอิง
 
 ---
 
-### ✅ เคล็ดลับเพิ่มเติม
+## 🎯 เทคนิคการตั้งค่าพารามิเตอร์
 
-**🔧 การเพิ่มประสิทธิภาพ:**
-- ใช้ **Medium quality** สำหรับใช้งานทั่วไป
-- ใช้ **High quality** เฉพาะเอกสารสำคัญ
-- **ตั้งค่า Temperature = 0.1** สำหรับความแม่นยำสูงสุด
-- **เลือกโมเดล Typhoon OCR** สำหรับภาษาไทย
+### 📊 สำหรับ OCR (การแปลงเอกสาร)
+- **Temperature: 0.1** → ความแม่นยำสูงสุด
+- **Top P: 0.6** → สมดุลที่ดีที่สุด
+- **Model: Typhoon OCR 7B** → เชี่ยวชาญด้าน OCR
 
-**⚡ การประมวลผลเร็วขึ้น:**
-- แยกไฟล์ขนาดใหญ่เป็นไฟล์เล็ก
-- ประมวลผลครั้งละไม่เกิน 5 ไฟล์
-- ใช้ **Low quality** สำหรับการทดสอบ
+### 💬 สำหรับ Q&A (การถามตอบ)
+- **Temperature: 0.3** → ความสมดุลระหว่างแม่นยำและสร้างสรรค์
+- **Model: Qwen2.5 14B** → เหมาะสำหรับการวิเคราะห์และตอบคำถาม
+- **Model: Typhoon2 8B** → ดีที่สุดสำหรับภาษาไทย
 
-**🎯 ความแม่นยำสูงขึ้น:**
-- สแกนด้วย **300 DPI** ขึ้นไป
-- ตรวจสอบแสงให้เหมาะสม
-- หลีกเลี่ยงการเอียงของเอกสาร
-- ใช้ **Structure prompt** สำหรับเอกสารซับซ้อน
+---
+
+## 🧠 RAG Knowledge Base คืออะไร?
+
+**RAG (Retrieval-Augmented Generation)** เป็นเทคโนโลยีที่ช่วยให้ AI สามารถ:
+
+### 🔍 การทำงานของ RAG:
+1. **จัดเก็บข้อมูล** → แบ่งเอกสารเป็นชิ้นเล็ก (chunks)
+2. **สร้าง Embeddings** → แปลงข้อความเป็นตัวเลขที่ AI เข้าใจ
+3. **ค้นหาอัจฉริยะ** → หาข้อมูลที่เกี่ยวข้องด้วย Semantic Search
+4. **ตอบคำถาม** → ใช้ข้อมูลที่ค้นหาได้มาสร้างคำตอบ
+
+### 💡 ข้อดีของ RAG:
+- ✅ **ตอบได้แม่นยำ** จากเอกสารจริง
+- ✅ **แสดงแหล่งอ้างอิง** โปร่งใส
+- ✅ **ไม่ Hallucination** ไม่แต่งเรื่อง
+- ✅ **ปรับปรุงได้ตลอด** เพิ่มเอกสารใหม่ได้เรื่อย ๆ
+
+---
+
+## 📱 วิธีใช้แต่ละแท็บ
+
+### 📁 Upload & OCR
+- **จุดประสงค์:** แปลงเอกสารเป็นข้อความ
+- **ไฟล์ที่รองรับ:** PDF, PNG, JPG, JPEG (สูงสุด 10MB)
+- **เทคนิค:** ใช้ "Structure mode" สำหรับเอกสารที่มีตาราง
+
+### 🧠 Knowledge Base  
+- **จุดประสงค์:** จัดการฐานข้อมูลความรู้
+- **ฟีเจอร์หลัก:**
+  - ดูสถิติเอกสารทั้งหมด
+  - เพิ่มเอกสารใหม่
+  - ดูตัวอย่างเนื้อหา
+  - ลบเอกสารที่ไม่ต้องการ
+
+### 💬 AI Chat
+- **จุดประสงค์:** ถามตอบเกี่ยวกับเอกสาร
+- **ฟีเจอร์พิเศษ:**
+  - แสดงแหล่งอ้างอิง
+  - คะแนน Similarity
+  - บันทึก Chat History
+  - ล้างการสนทนาได้
+
+---
+
+## ⚡ เคล็ดลับการใช้งาน
+
+### 🎯 เพิ่มประสิทธิภาพ OCR:
+1. **สแกนด้วยความละเอียดสูง** (300 DPI ขึ้นไป)
+2. **ตรวจสอบแสงให้เหมาะสม** หลีกเลี่ยงเงา
+3. **เอกสารตรง** ไม่เอียง
+4. **ใช้ "Structure mode"** สำหรับตารางซับซ้อน
+
+### 🧠 เพิ่มประสิทธิภาพ Knowledge Base:
+1. **แบ่งเอกสารใหญ่** เป็นหัวข้อย่อย ๆ
+2. **ใช้ชื่อไฟล์ที่มีความหมาย** เช่น "รายงานการเงิน_Q1_2024.md"
+3. **เพิ่มข้อมูลที่เกี่ยวข้องกัน** เพื่อให้ AI เข้าใจบริบท
+4. **ทำความสะอาดข้อมูล** เป็นระยะ ลบเอกสารที่ไม่จำเป็น
+
+### 💬 เทคนิคการถามคำถาม:
+1. **ใช้คำถามที่ชัดเจน** เช่น "มียอดขายในเดือนมกราคมเท่าไหร่?"
+2. **อ้างอิงชื่อเอกสาร** เช่น "จากรายงานการเงิน มีกำไรเท่าไหร่?"
+3. **ใช้ภาษาไทยหรืออังกฤษ** ตามความเหมาะสม
+4. **ขอให้เปรียบเทียบ** เช่น "เปรียบเทียบผลงานไตรมาส 1 กับ 2"
+
+### 🔧 แก้ปัญหาเบื้องต้น:
+- **OCR ไม่แม่นยำ** → เพิ่ม Image Quality, ใช้ Structure mode
+- **ไม่พบข้อมูล** → ตรวจสอบว่าเพิ่มเอกสารเข้า Knowledge Base แล้ว
+- **ตอบไม่ตรงคำถาม** → ทำให้คำถามชัดเจนขึ้น, เปลี่ยนโมเดล
+
+---
+
+## 🚀 การใช้งานขั้นสูง
+
+### 📊 Batch Processing:
+- เปิด "Enable Batch Processing" ในแท็บแรก
+- อัพโหลดหลายไฟล์พร้อมกัน
+- ใช้ปุ่ม "🧠 Add All to Knowledge Base" หลังประมวลผลเสร็จ
+
+### 🔄 Workflow แนะนำ:
+1. **วันแรก:** อัพโหลดเอกสารสำคัญทั้งหมด
+2. **ทุกสัปดาห์:** เพิ่มเอกสารใหม่
+3. **ใช้ประจำ:** ถามตอบเพื่อค้นหาข้อมูล
+4. **ทุกเดือน:** ทำความสะอาด Knowledge Base
+
+### 🎛️ การปรับแต่งโมเดล:
+- **งาน OCR** → Typhoon OCR 7B
+- **ถามตอบภาษาไทย** → Typhoon2 8B  
+- **วิเคราะห์ซับซ้อน** → Qwen2.5 14B
+
+---
+
+## ❓ FAQ
+
+**Q: ฐานข้อมูลจะหายไหมถ้าปิดเบราว์เซอร์?**
+A: ไม่หาย ระบบใช้ SQLite เก็บข้อมูลแบบถาวร
+
+**Q: สามารถใช้งานออฟไลน์ได้ไหม?**
+A: ไม่ได้ ต้องเชื่อมต่ออินเทอร์เน็ตเพื่อใช้งาน AI
+
+**Q: รองรับภาษาไทยแค่ไหน?**
+A: รองรับเต็มรูปแบบทั้ง OCR และ Q&A
+
+**Q: จำกัดขนาดไฟล์เท่าไหร่?**
+A: ไฟล์เดี่ยว 10MB, ไม่จำกัดจำนวนไฟล์
+
+**Q: ลบข้อมูลใน Knowledge Base ได้ไหม?**
+A: ได้ ไปที่แท็บ Knowledge Base แล้วใช้ปุ่มลบในแต่ละเอกสาร
         """)
 
 # Run the app
