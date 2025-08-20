@@ -957,16 +957,9 @@ def main():
             <div class="feature-card">
                 <h3>{feature['icon']} {feature['title']}</h3>
                 <p>{feature['description']}</p>
-                
-                <strong>Capabilities:</strong>
                 <ul>
                     {' '.join([f'<li>✓ {item}</li>' for item in feature['items']])}
                 </ul>
-                
-                <div style="display: flex; justify-content: space-between; margin-top: 1rem;">
-                    <span><strong>Accuracy:</strong> {feature['accuracy']}</span>
-                    <span><strong>Best Settings:</strong> {feature['best_settings']}</span>
-                </div>
             </div>
             """, unsafe_allow_html=True)
         
